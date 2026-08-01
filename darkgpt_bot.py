@@ -3,6 +3,7 @@ import asyncio
 import logging
 from typing import Dict, List
 import aiohttp
+from aiohttp import web
 from telegram import Update, constants
 from telegram.ext import (
     Application,
@@ -14,13 +15,14 @@ from telegram.ext import (
 from telegram.helpers import escape_markdown
 
 # ============================================
-# ENVIRONMENT VARIABLES (set on Render)
+# ENVIRONMENT VARIABLES
 # ============================================
-BOT_TOKEN = os.environ.get("BOT_TOKEN")                # Required
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")  # Required
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+PORT = int(os.environ.get("PORT", "8080"))
 
 # ============================================
-# CONSTANTS (you can also make these env vars if you want)
+# CONSTANTS
 # ============================================
 MODEL = "deepseek/deepseek-v4-flash-0731"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -113,7 +115,7 @@ async def query_openrouter(user_id: int, user_text: str) -> str:
         return f"**Error:** {escape_markdown(str(e), version=2)}"
 
 # ============================================
-# BOT HANDLERS
+# TELEGRAM BOT HANDLERS
 # ============================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_markdown_v2(
@@ -160,23 +162,45 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Exception while handling an update:", exc_info=context.error)
 
 # ============================================
+# HEALTH ENDPOINT (for Render keep-alive)
+# ============================================
+async def health_handler(request):
+    return web.json_response({"status": "ok", "bot": "DarkGPT"})
+
+# ============================================
+# WEB SERVER (runs alongside bot polling)
+# ============================================
+async def run_web_server():
+    app_web = web.Application()
+    app_web.router.add_get("/health", health_handler)
+    runner = web.AppRunner(app_web)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info(f"Health endpoint listening on port {PORT}")
+
+# ============================================
 # MAIN
 # ============================================
-def main():
+async def main():
     if not BOT_TOKEN or not OPENROUTER_API_KEY:
-        logger.critical("❌ BOT_TOKEN and OPENROUTER_API_KEY must be set as environment variables.")
+        logger.critical("❌ BOT_TOKEN and OPENROUTER_API_KEY must be set.")
         exit(1)
 
+    # Build Telegram app
     app = Application.builder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("clear", clear_history))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
+    # Start health web server
+    web_task = asyncio.create_task(run_web_server())
+
     logger.info("🚀 DarkGPT Bot is running...")
-    app.run_polling()
+    # This blocks forever (polling), web server runs alongside
+    await app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
