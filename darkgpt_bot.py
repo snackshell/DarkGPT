@@ -177,34 +177,37 @@ async def run_web_server():
     logger.info(f"Health endpoint listening on port {PORT}")
 
 # ============================================
-# MAIN — runs on the existing event loop
+# MAIN
 # ============================================
 async def main():
     if not BOT_TOKEN or not OPENROUTER_API_KEY:
         logger.critical("❌ BOT_TOKEN and OPENROUTER_API_KEY must be set.")
         exit(1)
 
-    # Build the application
     builder = ApplicationBuilder()
     builder.token(BOT_TOKEN)
     app = builder.build()
 
-    # Register handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("clear", clear_history))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
-    # Start health endpoint concurrently
+    # Start health endpoint as background task
     asyncio.create_task(run_web_server())
 
     logger.info("🚀 DarkGPT Bot is running...")
-
-    # This runs and blocks until SIGTERM, no need for asyncio.run() wrapper
     await app.run_polling(drop_pending_updates=True)
 
+# ============================================
+# ENTRY POINT
+# ============================================
 if __name__ == "__main__":
-    # Python 3.14 style — just run main() directly, no asyncio.run()
-    # This avoids the "event loop already running" issue
-    main()
+    try:
+        loop = asyncio.get_running_loop()
+        # If there's already a running loop, create a task
+        loop.create_task(main())
+    except RuntimeError:
+        # No running loop — create one and run
+        asyncio.run(main())
