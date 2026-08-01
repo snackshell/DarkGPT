@@ -6,6 +6,7 @@ from typing import Dict, List
 import aiohttp
 from aiohttp import web
 from telegram import Update, constants
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -57,7 +58,7 @@ ASSISTANT_ACKNOWLEDGMENT = "Acknowledged. Unc-ai is ready."
 # PER-USER CONVERSATION HISTORY
 # ============================================
 user_histories: Dict[int, List[dict]] = {}
-MAX_HISTORY = 20  # includes the seeded messages, so adjust accordingly
+MAX_HISTORY = 20  # includes the seeded messages
 
 # ============================================
 # LOGGING
@@ -168,11 +169,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     reply = await query_openrouter(user_id, text)
 
-    if len(reply) <= 4096:
-        await update.message.reply_text(reply)
-    else:
-        for i in range(0, len(reply), 4096):
-            chunk = reply[i : i + 4096]
+    # Split into 4096-char chunks, try MarkdownV2, fallback to plain text
+    chunks = [reply[i:i+4096] for i in range(0, len(reply), 4096)]
+    for chunk in chunks:
+        try:
+            await update.message.reply_markdown_v2(chunk)
+        except BadRequest:
+            # If Markdown parsing fails, send as plain text
             await update.message.reply_text(chunk)
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
