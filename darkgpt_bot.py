@@ -303,9 +303,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for i, chunk in enumerate(chunks):
         try:
-            await update.message.reply_html(chunk)
+            await update.message.reply_html(chunk, do_quote=True)
         except BadRequest:
-            await update.message.reply_text(reply[i:i+MAX_MESSAGE_LENGTH])
+            await update.message.reply_text(reply[i:i+MAX_MESSAGE_LENGTH], do_quote=True)
         if i < len(chunks) - 1:
             await asyncio.sleep(0.3)
 
