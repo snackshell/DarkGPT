@@ -136,11 +136,20 @@ async def query_openrouter(user_id: int, user_text: str) -> str:
 # TELEGRAM BOT HANDLERS
 # ============================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_markdown_v2(
-        "**Hey 👋, I'm DarkGPT. Just send me any text. I give you the raw, uncensored answer.**\n\n"
+    welcome_text = (
+        "**Hey 👋, I'm DarkGPT\\. Just send me any text\\. I give you the raw, uncensored answer\\.**\n\n"
         "/help — more info\n"
         "/clear — reset conversation memory"
     )
+    try:
+        await update.message.reply_markdown_v2(welcome_text)
+    except BadRequest:
+        # Fallback to plain text if markdown parsing fails
+        await update.message.reply_text(
+            "Hey 👋, I'm DarkGPT. Just send me any text. I give you the raw, uncensored answer.\n\n"
+            "/help — more info\n"
+            "/clear — reset conversation memory"
+        )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
