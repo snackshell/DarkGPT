@@ -5,21 +5,25 @@ import logging
 import re
 import time
 import json
+import html
 import tempfile
 from pathlib import Path
 from typing import List, Dict, Tuple
 import aiohttp
 from aiohttp import web
-from telegram import Update, constants
+from telegram import Update, constants, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest, RetryAfter
 from telegram.ext import (
     Application,
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     filters,
     ContextTypes,
 )
+
+import access_control as ac
 
 # ============================================
 # ENVIRONMENT VARIABLES
@@ -348,6 +352,10 @@ async def stream_openrouter(user_id: int, user_text: str, status_message) -> str
 # TELEGRAM BOT HANDLERS
 # ============================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # /start doubles as the apply entry point: approved users see the welcome,
+    # everyone else gets registered as pending and told to wait.
+    if not await ensure_access(update, context):
+        return
     await update.message.reply_html(
         "<b>Hey 👋, I'm DarkGPT. Just send me any text. I give you the raw, uncensored answer.</b>\n\n"
         "/help — more info\n"
@@ -355,23 +363,40 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    text = (
         "DarkGPT-ai Commands:\n"
-        "/start — Welcome\n"
+        "/start — Welcome / apply for access\n"
         "/help — This menu\n"
-        "/clear — Forget conversation history\n\n"
+        "/clear — Forget conversation history\n"
+        "/whoami — Show your ID and access status\n\n"
         "Just type anything. No filters, no limits.\n"
         "You can also upload files (.py, .txt, .json, .md, .csv, etc.) for analysis.\n\n"
         f"⚠️ Rate limit: {RATE_LIMIT_MAX} messages every {RATE_LIMIT_WINDOW} seconds."
     )
+    if await ac.is_admin(update.effective_user.id):
+        text += (
+            "\n\n👑 Admin commands:\n"
+            "/pending — Review access requests\n"
+            "/approve <id|@user> — Approve someone\n"
+            "/deny <id|@user> — Deny someone\n"
+            "/grant <id|@user> — Manually add a user\n"
+            "/revoke <id|@user> — Remove a user\n"
+            "/users — List approved users\n"
+            "/stats — Access counts"
+        )
+    await update.message.reply_text(text)
 
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_access(update, context):
+        return
     user_id = update.effective_user.id
     if user_id in user_memory:
         del user_memory[user_id]
     await update.message.reply_text("🧠 Memory wiped.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_access(update, context):
+        return
     user_id = update.effective_user.id
     if is_rate_limited(user_id):
         await update.message.reply_text(
@@ -383,6 +408,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await stream_openrouter(user_id, update.message.text, status_msg)
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_access(update, context):
+        return
     user_id = update.effective_user.id
     if is_rate_limited(user_id):
         await update.message.reply_text(
@@ -436,6 +463,248 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Exception while handling an update:", exc_info=context.error)
 
 # ============================================
+# ACCESS CONTROL — apply / approve gate
+# ============================================
+APPLY_SUBMITTED_MSG = (
+    "🔒 <b>DarkGPT is invite-only.</b>\n\n"
+    "Your access request has been <b>submitted</b> and is waiting for the admin "
+    "to review it.\n\n"
+    "Your ID: <code>{uid}</code>\n"
+    "You'll get a message here the moment you're approved."
+)
+APPLY_PENDING_MSG = (
+    "⏳ <b>Your access request is still pending.</b>\n\n"
+    "Please wait for the admin to approve you.\n"
+    "Your ID: <code>{uid}</code>"
+)
+DENIED_MSG = (
+    "⛔ <b>Access denied.</b>\n\n"
+    "Your request to use DarkGPT was declined."
+)
+BACKEND_DOWN_MSG = "⚠️ Access system is temporarily unavailable. Please try again in a moment."
+
+
+def _describe_user(user) -> str:
+    uname = f"@{user.username}" if user.username else "—"
+    return (
+        f"Name: {html.escape(user.full_name or '—')}\n"
+        f"Username: {html.escape(uname)}\n"
+        f"User ID: <code>{user.id}</code>"
+    )
+
+
+async def notify_admins_new_request(context: ContextTypes.DEFAULT_TYPE, user):
+    text = "🆕 <b>New access request</b>\n\n" + _describe_user(user)
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve", callback_data=f"approve:{user.id}"),
+        InlineKeyboardButton("⛔ Deny", callback_data=f"deny:{user.id}"),
+    ]])
+    for admin_id in ac.ADMIN_IDS:
+        try:
+            await context.bot.send_message(
+                admin_id, text, parse_mode="HTML", reply_markup=keyboard
+            )
+        except Exception:
+            logger.warning("Could not notify admin %s of new request", admin_id)
+
+
+async def notify_user_decision(context: ContextTypes.DEFAULT_TYPE, tid: int, approved: bool):
+    try:
+        if approved:
+            await context.bot.send_message(
+                tid,
+                "✅ <b>You're approved!</b>\nDarkGPT is now unlocked for you — "
+                "just send a message to begin.",
+                parse_mode="HTML",
+            )
+        else:
+            await context.bot.send_message(tid, DENIED_MSG, parse_mode="HTML")
+    except Exception:
+        # User may not have started a chat with the bot yet; ignore.
+        pass
+
+
+async def ensure_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Gate every real interaction. Returns True if the user may proceed."""
+    user = update.effective_user
+    status, is_new, _ = await ac.resolve_access(user.id, user.username, user.first_name)
+
+    if status in ("admin", "approved"):
+        return True
+    if status == "pending":
+        if is_new:
+            await notify_admins_new_request(context, user)
+            await update.message.reply_html(APPLY_SUBMITTED_MSG.format(uid=user.id))
+        else:
+            await update.message.reply_html(APPLY_PENDING_MSG.format(uid=user.id))
+        return False
+    if status == "denied":
+        await update.message.reply_html(DENIED_MSG)
+        return False
+    await update.message.reply_text(BACKEND_DOWN_MSG)
+    return False
+
+
+async def require_admin(update: Update) -> bool:
+    if await ac.is_admin(update.effective_user.id):
+        return True
+    await update.message.reply_text("⛔ This command is for admins only.")
+    return False
+
+
+# ============================================
+# ADMIN COMMANDS
+# ============================================
+async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update):
+        return
+    try:
+        rows = await ac.list_by_status("pending")
+    except Exception:
+        await update.message.reply_text(BACKEND_DOWN_MSG)
+        return
+    if not rows:
+        await update.message.reply_text("✅ No pending requests.")
+        return
+    for r in rows[:20]:
+        uname = f"@{r['username']}" if r.get("username") else "—"
+        text = (
+            "⏳ <b>Pending request</b>\n"
+            f"Name: {html.escape(r.get('first_name') or '—')}\n"
+            f"Username: {html.escape(uname)}\n"
+            f"User ID: <code>{r.get('telegram_id') or '—'}</code>"
+        )
+        kb = None
+        if r.get("telegram_id"):
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Approve", callback_data=f"approve:{r['telegram_id']}"),
+                InlineKeyboardButton("⛔ Deny", callback_data=f"deny:{r['telegram_id']}"),
+            ]])
+        await update.message.reply_html(text, reply_markup=kb)
+
+
+async def _admin_decide(update, context, decide_fn, verb: str):
+    if not await require_admin(update):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            f"Usage: /{verb} <user_id | @username>"
+        )
+        return
+    identifier = context.args[0]
+    try:
+        rec = await decide_fn(identifier, update.effective_user.id)
+    except Exception:
+        await update.message.reply_text(BACKEND_DOWN_MSG)
+        return
+    if not rec:
+        await update.message.reply_text("❌ Could not process that user.")
+        return
+    approved = verb in ("approve", "grant")
+    who = f"@{rec['username']}" if rec.get("username") else f"ID {rec.get('telegram_id')}"
+    await update.message.reply_html(
+        f"{'✅ Approved' if approved else '⛔ Denied'}: <b>{html.escape(str(who))}</b>"
+    )
+    if rec.get("telegram_id"):
+        await notify_user_decision(context, rec["telegram_id"], approved)
+
+
+async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _admin_decide(update, context, ac.approve, "approve")
+
+
+async def cmd_grant(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _admin_decide(update, context, ac.approve, "grant")
+
+
+async def cmd_deny(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _admin_decide(update, context, ac.deny, "deny")
+
+
+async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _admin_decide(update, context, ac.deny, "revoke")
+
+
+async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update):
+        return
+    try:
+        rows = await ac.list_by_status("approved")
+    except Exception:
+        await update.message.reply_text(BACKEND_DOWN_MSG)
+        return
+    if not rows:
+        await update.message.reply_text("No approved users yet.")
+        return
+    lines = ["✅ <b>Approved users</b>"]
+    for r in rows[:50]:
+        uname = f"@{r['username']}" if r.get("username") else "—"
+        lines.append(
+            f"• {html.escape(r.get('first_name') or '—')} "
+            f"({html.escape(uname)}) — <code>{r.get('telegram_id') or 'not linked'}</code>"
+        )
+    await update.message.reply_html("\n".join(lines))
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update):
+        return
+    try:
+        c = await ac.counts()
+    except Exception:
+        await update.message.reply_text(BACKEND_DOWN_MSG)
+        return
+    await update.message.reply_html(
+        "📊 <b>Access stats</b>\n"
+        f"Approved: <b>{c['approved']}</b>\n"
+        f"Pending: <b>{c['pending']}</b>\n"
+        f"Denied: <b>{c['denied']}</b>"
+    )
+
+
+async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if await ac.is_admin(user.id):
+        status = "admin"
+    else:
+        rec = await ac.peek_status(user.id)
+        status = rec.get("status") if rec else "not registered"
+    await update.message.reply_html(
+        "👤 <b>You</b>\n"
+        f"{_describe_user(user)}\n"
+        f"Status: <b>{html.escape(str(status))}</b>"
+    )
+
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not await ac.is_admin(query.from_user.id):
+        await query.answer("Not authorized.", show_alert=True)
+        return
+    await query.answer()
+    action, _, tid_str = query.data.partition(":")
+    if not tid_str.lstrip("-").isdigit():
+        return
+    tid = int(tid_str)
+    approved = action == "approve"
+    try:
+        if approved:
+            await ac.approve(str(tid), query.from_user.id)
+        else:
+            await ac.deny(str(tid), query.from_user.id)
+    except Exception:
+        await query.answer(BACKEND_DOWN_MSG, show_alert=True)
+        return
+    tag = "✅ <b>Approved</b>" if approved else "⛔ <b>Denied</b>"
+    try:
+        await query.edit_message_text(
+            (query.message.text_html or "") + f"\n\n{tag}", parse_mode="HTML"
+        )
+    except Exception:
+        pass
+    await notify_user_decision(context, tid, approved)
+
+# ============================================
 # HEALTH ENDPOINT
 # ============================================
 async def health_handler(request):
@@ -458,10 +727,32 @@ async def main():
         logger.critical("❌ BOT_TOKEN and OPENROUTER_API_KEY must be set.")
         exit(1)
 
+    if ac.is_configured():
+        logger.info("🔐 Access control ENABLED (Supabase). Admins: %s", sorted(ac.ADMIN_IDS) or "none")
+        if not ac.ADMIN_IDS:
+            logger.warning("⚠️ No ADMIN_IDS set — nobody can approve requests. Set ADMIN_IDS.")
+    else:
+        logger.warning(
+            "⚠️ Supabase not configured (SUPABASE_URL / SUPABASE_SERVICE_KEY missing). "
+            "Only ADMIN_IDS users will be allowed; everyone else is denied."
+        )
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("clear", clear_history))
+    app.add_handler(CommandHandler("whoami", cmd_whoami))
+
+    # Admin access-control commands
+    app.add_handler(CommandHandler("pending", cmd_pending))
+    app.add_handler(CommandHandler("approve", cmd_approve))
+    app.add_handler(CommandHandler("grant", cmd_grant))
+    app.add_handler(CommandHandler("deny", cmd_deny))
+    app.add_handler(CommandHandler("revoke", cmd_revoke))
+    app.add_handler(CommandHandler("users", cmd_users))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^(approve|deny):"))
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_error_handler(error_handler)
