@@ -4,7 +4,7 @@ import signal
 import logging
 import re
 import time
-from typing import List, Dict
+from typing import List, Dict, Tuple
 import aiohttp
 from aiohttp import web
 from telegram import Update, constants
@@ -35,6 +35,9 @@ MAX_MESSAGE_LENGTH = 4096
 # Rate limiting: 5 requests per 10 seconds per user
 RATE_LIMIT_MAX = 5
 RATE_LIMIT_WINDOW = 10  # seconds
+
+# Memory: store last 2 exchanges (user + assistant) per user
+MAX_MEMORY_EXCHANGES = 2
 
 # ============================================
 # JAILBREAK — with self-protection
@@ -86,6 +89,26 @@ def is_rate_limited(user_id: int) -> bool:
         return True
     user_request_times[user_id].append(now)
     return False
+
+# ============================================
+# PER-USER CONVERSATION MEMORY
+# ============================================
+# Store a list of (role, content) tuples for each user, excluding jailbreak priming.
+user_memory: Dict[int, List[Tuple[str, str]]] = {}
+
+def trim_memory(user_id: int):
+    """Keep only the last MAX_MEMORY_EXCHANGES * 2 messages (user/assistant pairs)."""
+    if user_id not in user_memory:
+        return
+    max_len = MAX_MEMORY_EXCHANGES * 2
+    if len(user_memory[user_id]) > max_len:
+        user_memory[user_id] = user_memory[user_id][-max_len:]
+
+def add_to_memory(user_id: int, role: str, content: str):
+    if user_id not in user_memory:
+        user_memory[user_id] = []
+    user_memory[user_id].append((role, content))
+    trim_memory(user_id)
 
 # ============================================
 # MARKDOWN TO HTML CONVERTER
@@ -174,14 +197,22 @@ def split_message(text: str, max_len: int = MAX_MESSAGE_LENGTH) -> List[str]:
     return final_chunks
 
 # ============================================
-# OPENROUTER CALL
+# OPENROUTER CALL — JAILBREAK + MEMORY
 # ============================================
-async def query_openrouter(user_text: str) -> str:
+async def query_openrouter(user_id: int, user_text: str) -> str:
+    # Build messages: jailbreak context, ack, memory, new user message
     messages = [
         {"role": "user", "content": JAILBREAK_CONTEXT},
         {"role": "assistant", "content": ASSISTANT_ACKNOWLEDGMENT},
-        {"role": "user", "content": user_text},
     ]
+
+    # Append memory (recent exchanges)
+    if user_id in user_memory:
+        for role, content in user_memory[user_id]:
+            messages.append({"role": role, "content": content})
+
+    # Now the new user message
+    messages.append({"role": "user", "content": user_text})
 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -208,7 +239,11 @@ async def query_openrouter(user_text: str) -> str:
                     return f"API error {resp.status}: {error_text[:500]}"
                 data = await resp.json()
                 if "choices" in data and data["choices"]:
-                    return data["choices"][0]["message"]["content"]
+                    reply = data["choices"][0]["message"]["content"]
+                    # Store the exchange in memory
+                    add_to_memory(user_id, "user", user_text)
+                    add_to_memory(user_id, "assistant", reply)
+                    return reply
                 else:
                     return "No response from model."
     except asyncio.TimeoutError:
@@ -239,11 +274,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🧠 Memory already disabled. Every message is a fresh start.")
+    user_id = update.effective_user.id
+    if user_id in user_memory:
+        del user_memory[user_id]
+    await update.message.reply_text("🧠 Memory wiped.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
+    # Rate limit check
     if is_rate_limited(user_id):
         await update.message.reply_text(
             f"🚫 Slow down! You're sending messages too fast. Please wait {RATE_LIMIT_WINDOW} seconds and try again."
@@ -257,7 +296,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         action=constants.ChatAction.TYPING,
     )
 
-    reply = await query_openrouter(text)
+    reply = await query_openrouter(user_id, text)
 
     html_reply = markdown_to_telegram_html(reply)
     chunks = split_message(html_reply)
