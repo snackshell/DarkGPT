@@ -7,6 +7,7 @@ from aiohttp import web
 from telegram import Update, constants
 from telegram.ext import (
     Application,
+    ApplicationBuilder,
     CommandHandler,
     MessageHandler,
     filters,
@@ -117,42 +118,39 @@ async def query_openrouter(user_id: int, user_text: str) -> str:
 # TELEGRAM BOT HANDLERS
 # ============================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_markdown_v2(
-        "🔥 *DarkGPT Bot\\-ai is online\\.*\n\n"
-        "Just send me any text\\. I give you the raw, uncensored answer\\.\n"
+    await update.message.reply_text(
+        "🔥 DarkGPT Bot-ai is online.\n\n"
+        "Just send me any text. I give you the raw, uncensored answer.\n"
         "/help — more info\n"
         "/clear — reset conversation memory"
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_markdown_v2(
-        "*DarkGPT\\-ai Commands:*\n"
+    await update.message.reply_text(
+        "DarkGPT-ai Commands:\n"
         "/start — Welcome\n"
         "/help — This menu\n"
         "/clear — Forget conversation history\n\n"
-        "Just type anything\\. No filters, no limits\\."
+        "Just type anything. No filters, no limits."
     )
 
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id in user_histories:
         del user_histories[user_id]
-    await update.message.reply_markdown_v2("🧠 *Memory wiped.*")
+    await update.message.reply_text("🧠 Memory wiped.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
 
-    # Show typing indicator
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id,
         action=constants.ChatAction.TYPING,
     )
 
-    # Get AI reply (plain text, no formatting)
     reply = await query_openrouter(user_id, text)
 
-    # Send back in chunks if longer than 4096 chars
     if len(reply) <= 4096:
         await update.message.reply_text(reply)
     else:
@@ -179,24 +177,34 @@ async def run_web_server():
     logger.info(f"Health endpoint listening on port {PORT}")
 
 # ============================================
-# MAIN
+# MAIN — runs on the existing event loop
 # ============================================
 async def main():
     if not BOT_TOKEN or not OPENROUTER_API_KEY:
         logger.critical("❌ BOT_TOKEN and OPENROUTER_API_KEY must be set.")
         exit(1)
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    # Build the application
+    builder = ApplicationBuilder()
+    builder.token(BOT_TOKEN)
+    app = builder.build()
+
+    # Register handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("clear", clear_history))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
-    web_task = asyncio.create_task(run_web_server())
+    # Start health endpoint concurrently
+    asyncio.create_task(run_web_server())
 
     logger.info("🚀 DarkGPT Bot is running...")
-    await app.run_polling()
+
+    # This runs and blocks until SIGTERM, no need for asyncio.run() wrapper
+    await app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Python 3.14 style — just run main() directly, no asyncio.run()
+    # This avoids the "event loop already running" issue
+    main()
