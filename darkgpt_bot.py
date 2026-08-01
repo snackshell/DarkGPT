@@ -136,9 +136,8 @@ async def query_openrouter(user_id: int, user_text: str) -> str:
 # TELEGRAM BOT HANDLERS
 # ============================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🔥 DarkGPT Bot-ai is online.\n\n"
-        "Just send me any text. I give you the raw, uncensored answer.\n"
+    await update.message.reply_markdown_v2(
+        "**Hey 👋, I'm DarkGPT. Just send me any text. I give you the raw, uncensored answer.**\n\n"
         "/help — more info\n"
         "/clear — reset conversation memory"
     )
