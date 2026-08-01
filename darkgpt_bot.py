@@ -11,7 +11,7 @@ from typing import List, Dict, Tuple
 import aiohttp
 from aiohttp import web
 from telegram import Update, constants
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Flood
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -222,7 +222,7 @@ def split_message(text: str, max_len: int = MAX_MESSAGE_LENGTH) -> List[str]:
     return final_chunks
 
 # ============================================
-# OPENROUTER STREAMING CALL
+# OPENROUTER STREAMING CALL (FIXED)
 # ============================================
 async def stream_openrouter(user_id: int, user_text: str, status_message) -> str:
     """Stream the AI response, editing the status message in real-time."""
@@ -256,6 +256,8 @@ async def stream_openrouter(user_id: int, user_text: str, status_message) -> str
 
     full_response = ""
     last_edit_time = time.time()
+    last_text = ""  # Track the last edited text to avoid "Message is not modified" errors
+    edit_interval = 0.7  # seconds between edits, safe from flood limits
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -265,7 +267,7 @@ async def stream_openrouter(user_id: int, user_text: str, status_message) -> str
                 if resp.status != 200:
                     error_text = await resp.text()
                     error_msg = f"API error {resp.status}: {error_text[:500]}"
-                    await status_message.edit_text(error_msg)
+                    await safe_edit(status_message, error_msg)
                     return error_msg
 
                 buffer = ""
@@ -290,16 +292,18 @@ async def stream_openrouter(user_id: int, user_text: str, status_message) -> str
                                 if content:
                                     full_response += content
 
-                                    # Edit the message every ~250ms for smooth streaming
                                     current_time = time.time()
-                                    if current_time - last_edit_time > 0.25:
-                                        html_content = markdown_to_telegram_html(full_response)
+                                    if current_time - last_edit_time > edit_interval:
+                                        new_text = full_response
+                                        # Convert to HTML for display
+                                        html_content = markdown_to_telegram_html(new_text)
                                         if len(html_content) > MAX_MESSAGE_LENGTH:
                                             html_content = html_content[:MAX_MESSAGE_LENGTH - 100] + "\n\n<i>(continuing...)</i>"
-                                        try:
-                                            await status_message.edit_text(html_content, parse_mode="HTML")
-                                        except BadRequest:
-                                            await status_message.edit_text(full_response[:MAX_MESSAGE_LENGTH])
+
+                                        # Only edit if the text actually changed
+                                        if html_content != last_text:
+                                            await safe_edit(status_message, html_content)
+                                            last_text = html_content
                                         last_edit_time = current_time
                         except json.JSONDecodeError:
                             continue
@@ -308,21 +312,27 @@ async def stream_openrouter(user_id: int, user_text: str, status_message) -> str
                 html_reply = markdown_to_telegram_html(full_response)
 
                 if len(html_reply) > MAX_MESSAGE_LENGTH:
-                    # If too long, update the first message with a portion, then send the rest
                     first_chunk = html_reply[:MAX_MESSAGE_LENGTH]
-                    await status_message.edit_text(first_chunk, parse_mode="HTML")
+                    await safe_edit(status_message, first_chunk)
 
-                    # Send remaining chunks as new messages
                     remaining = html_reply[MAX_MESSAGE_LENGTH:]
                     chunks = split_message(remaining)
                     for chunk in chunks:
                         try:
                             await status_message.reply_html(chunk)
-                        except BadRequest:
-                            await status_message.reply_text(remaining[:MAX_MESSAGE_LENGTH])
+                        except (BadRequest, Flood) as e:
+                            if isinstance(e, Flood):
+                                await asyncio.sleep(e.retry_after + 1)
+                                try:
+                                    await status_message.reply_html(chunk)
+                                except:
+                                    await status_message.reply_text(chunk)
+                            else:
+                                await status_message.reply_text(chunk)
                         await asyncio.sleep(0.3)
                 else:
-                    await status_message.edit_text(html_reply, parse_mode="HTML")
+                    if html_reply != last_text:
+                        await safe_edit(status_message, html_reply)
 
                 # Store in memory
                 add_to_memory(user_id, "user", user_text)
@@ -332,13 +342,38 @@ async def stream_openrouter(user_id: int, user_text: str, status_message) -> str
 
     except asyncio.TimeoutError:
         error_msg = "Request timed out."
-        await status_message.edit_text(error_msg)
+        await safe_edit(status_message, error_msg)
         return error_msg
     except Exception as e:
         logger.exception("OpenRouter streaming call failed")
         error_msg = f"Error: {str(e)}"
-        await status_message.edit_text(error_msg)
+        await safe_edit(status_message, error_msg)
         return error_msg
+
+
+async def safe_edit(message, new_text: str, parse_mode: str = "HTML"):
+    """Edit a Telegram message safely, handling Flood and BadRequest errors."""
+    try:
+        await message.edit_text(new_text, parse_mode=parse_mode)
+    except Flood as e:
+        wait = e.retry_after + 1 if hasattr(e, 'retry_after') else 30
+        logger.warning(f"Flood wait for {wait}s")
+        await asyncio.sleep(wait)
+        try:
+            await message.edit_text(new_text, parse_mode=parse_mode)
+        except Exception as e2:
+            logger.error(f"Retry edit failed: {e2}")
+    except BadRequest as e:
+        if "Message is not modified" in str(e):
+            pass  # ignore, it's a duplicate edit
+        else:
+            # Fallback to plain text
+            try:
+                await message.edit_text(new_text)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error(f"Edit error: {e}")
 
 # ============================================
 # TELEGRAM BOT HANDLERS
@@ -382,7 +417,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Send initial placeholder message for streaming
     status_msg = await update.message.reply_text("⏳ DarkGPT is thinking...", do_quote=True)
 
-    # Stream the response (this handles everything internally)
+    # Stream the response
     await stream_openrouter(user_id, text, status_msg)
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
