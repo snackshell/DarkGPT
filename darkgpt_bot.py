@@ -12,7 +12,6 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from telegram.helpers import escape_markdown
 
 # ============================================
 # ENVIRONMENT VARIABLES
@@ -98,7 +97,7 @@ async def query_openrouter(user_id: int, user_text: str) -> str:
             ) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
-                    return f"**API error {resp.status}:** {error_text[:500]}"
+                    return f"API error {resp.status}: {error_text[:500]}"
                 data = await resp.json()
                 if "choices" in data and data["choices"]:
                     reply = data["choices"][0]["message"]["content"]
@@ -107,12 +106,12 @@ async def query_openrouter(user_id: int, user_text: str) -> str:
                         del history[1]
                     return reply
                 else:
-                    return "**No response from model.**"
+                    return "No response from model."
     except asyncio.TimeoutError:
-        return "**Request timed out.**"
+        return "Request timed out."
     except Exception as e:
         logger.exception("OpenRouter call failed")
-        return f"**Error:** {escape_markdown(str(e), version=2)}"
+        return f"Error: {str(e)}"
 
 # ============================================
 # TELEGRAM BOT HANDLERS
@@ -144,32 +143,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
 
+    # Show typing indicator
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id,
         action=constants.ChatAction.TYPING,
     )
 
+    # Get AI reply (plain text, no formatting)
     reply = await query_openrouter(user_id, text)
 
+    # Send back in chunks if longer than 4096 chars
     if len(reply) <= 4096:
-        await update.message.reply_markdown_v2(reply)
+        await update.message.reply_text(reply)
     else:
         for i in range(0, len(reply), 4096):
             chunk = reply[i : i + 4096]
-            await update.message.reply_markdown_v2(chunk)
+            await update.message.reply_text(chunk)
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Exception while handling an update:", exc_info=context.error)
 
 # ============================================
-# HEALTH ENDPOINT (for Render keep-alive)
+# HEALTH ENDPOINT
 # ============================================
 async def health_handler(request):
     return web.json_response({"status": "ok", "bot": "DarkGPT"})
 
-# ============================================
-# WEB SERVER (runs alongside bot polling)
-# ============================================
 async def run_web_server():
     app_web = web.Application()
     app_web.router.add_get("/health", health_handler)
@@ -187,7 +186,6 @@ async def main():
         logger.critical("❌ BOT_TOKEN and OPENROUTER_API_KEY must be set.")
         exit(1)
 
-    # Build Telegram app
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
@@ -195,11 +193,9 @@ async def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
-    # Start health web server
     web_task = asyncio.create_task(run_web_server())
 
     logger.info("🚀 DarkGPT Bot is running...")
-    # This blocks forever (polling), web server runs alongside
     await app.run_polling()
 
 if __name__ == "__main__":
