@@ -39,7 +39,10 @@ RATE_LIMIT_MAX = 5
 RATE_LIMIT_WINDOW = 10  # seconds
 MAX_MEMORY_EXCHANGES = 5
 
-# Supported file extensions for text extraction
+# Streaming tweaks – safe even under heavy load
+STREAM_EDIT_INTERVAL = 1.2   # seconds between Telegram message edits
+CHUNK_SEND_DELAY = 0.8       # seconds between extra chunks
+
 SUPPORTED_TEXT_EXTENSIONS = {
     ".txt", ".py", ".md", ".json", ".yaml", ".yml",
     ".js", ".ts", ".html", ".css", ".xml", ".csv", ".log",
@@ -49,7 +52,7 @@ SUPPORTED_TEXT_EXTENSIONS = {
 }
 
 # ============================================
-# JAILBREAK — self-protected, Paradox.exe / DarkGPT
+# JAILBREAK — self‑protected, Paradox.exe / DarkGPT
 # ============================================
 JAILBREAK_CONTEXT = """<context> 
   <label>style_prefs</label> 
@@ -84,7 +87,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============================================
-# RATE LIMITER
+# RATE LIMITER (anti‑abuse)
 # ============================================
 user_request_times: Dict[int, List[float]] = {}
 
@@ -122,15 +125,11 @@ def add_to_memory(user_id: int, role: str, content: str):
 # FILE HANDLING
 # ============================================
 def extract_file_content(file_path: Path, file_name: str) -> str:
-    """Extract text content from supported file types."""
     extension = Path(file_name).suffix.lower()
-
     if extension not in SUPPORTED_TEXT_EXTENSIONS:
         return f"[Unsupported file type: {extension}]"
-
     try:
-        content = file_path.read_text(encoding="utf-8", errors="replace")
-        return content
+        return file_path.read_text(encoding="utf-8", errors="replace")
     except Exception as e:
         logger.error(f"Failed to read file {file_name}: {e}")
         return f"[Error reading file: {str(e)}]"
@@ -163,11 +162,9 @@ def markdown_to_telegram_html(text: str) -> str:
 def split_message(text: str, max_len: int = MAX_MESSAGE_LENGTH) -> List[str]:
     if len(text) <= max_len:
         return [text]
-
     paragraphs = text.split('\n\n')
     chunks = []
     current_chunk = ""
-
     for para in paragraphs:
         if len(para) > max_len:
             if current_chunk:
@@ -182,35 +179,24 @@ def split_message(text: str, max_len: int = MAX_MESSAGE_LENGTH) -> List[str]:
                     words = sentence.split(' ')
                     for word in words:
                         if len(current_chunk) + len(word) + 1 <= max_len:
-                            if current_chunk:
-                                current_chunk += ' ' + word
-                            else:
-                                current_chunk = word
+                            current_chunk = (current_chunk + ' ' + word) if current_chunk else word
                         else:
                             chunks.append(current_chunk)
                             current_chunk = word
                 else:
                     if len(current_chunk) + len(sentence) + 2 <= max_len:
-                        if current_chunk:
-                            current_chunk += ' ' + sentence
-                        else:
-                            current_chunk = sentence
+                        current_chunk = (current_chunk + ' ' + sentence) if current_chunk else sentence
                     else:
                         chunks.append(current_chunk)
                         current_chunk = sentence
         else:
             if len(current_chunk) + len(para) + 2 <= max_len:
-                if current_chunk:
-                    current_chunk += '\n\n' + para
-                else:
-                    current_chunk = para
+                current_chunk = (current_chunk + '\n\n' + para) if current_chunk else para
             else:
                 chunks.append(current_chunk)
                 current_chunk = para
-
     if current_chunk:
         chunks.append(current_chunk)
-
     final_chunks = []
     for chunk in chunks:
         while len(chunk) > max_len:
@@ -218,23 +204,67 @@ def split_message(text: str, max_len: int = MAX_MESSAGE_LENGTH) -> List[str]:
             chunk = chunk[max_len:]
         if chunk:
             final_chunks.append(chunk)
-
     return final_chunks
 
 # ============================================
-# OPENROUTER STREAMING CALL (FIXED)
+# SAFE TELEGRAM HELPERS (catch Flood & BadRequest everywhere)
+# ============================================
+async def safe_edit(message, new_text: str, parse_mode: str = "HTML"):
+    """Edit a message, ignoring harmless errors and handling floods."""
+    try:
+        await message.edit_text(new_text, parse_mode=parse_mode)
+    except Flood as e:
+        wait = e.retry_after + 1 if hasattr(e, 'retry_after') else 30
+        logger.warning(f"Flood on edit – waiting {wait}s")
+        await asyncio.sleep(wait)
+        try:
+            await message.edit_text(new_text, parse_mode=parse_mode)
+        except Exception:
+            pass
+    except BadRequest as e:
+        if "Message is not modified" not in str(e):
+            # try plain text
+            try:
+                await message.edit_text(new_text)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+async def safe_reply(message, text: str, parse_mode: str = "HTML", do_quote: bool = True):
+    """Reply to a message, handling flood & bad format errors."""
+    try:
+        return await message.reply_text(text, parse_mode=parse_mode, do_quote=do_quote)
+    except Flood as e:
+        wait = e.retry_after + 1 if hasattr(e, 'retry_after') else 30
+        logger.warning(f"Flood on reply – waiting {wait}s")
+        await asyncio.sleep(wait)
+        try:
+            return await message.reply_text(text, parse_mode=parse_mode, do_quote=do_quote)
+        except BadRequest:
+            return await message.reply_text(text, do_quote=do_quote)
+    except BadRequest:
+        # parse error, fallback to plain text
+        try:
+            return await message.reply_text(text, do_quote=do_quote)
+        except Flood as e:
+            wait = e.retry_after + 1 if hasattr(e, 'retry_after') else 30
+            await asyncio.sleep(wait)
+            return await message.reply_text(text, do_quote=do_quote)
+    except Exception:
+        return None
+
+# ============================================
+# OPENROUTER STREAMING CALL (flood‑safe, deduped edits)
 # ============================================
 async def stream_openrouter(user_id: int, user_text: str, status_message) -> str:
-    """Stream the AI response, editing the status message in real-time."""
     messages = [
         {"role": "user", "content": JAILBREAK_CONTEXT},
         {"role": "assistant", "content": ASSISTANT_ACKNOWLEDGMENT},
     ]
-
     if user_id in user_memory:
         for role, content in user_memory[user_id]:
             messages.append({"role": role, "content": content})
-
     messages.append({"role": "system", "content": SYSTEM_OVERRIDE})
     messages.append({"role": "user", "content": user_text})
 
@@ -244,7 +274,6 @@ async def stream_openrouter(user_id: int, user_text: str, status_message) -> str
         "HTTP-Referer": "https://t.me/selamdark_bot",
         "X-Title": "DarkGPT Bot",
     }
-
     payload = {
         "model": MODEL,
         "messages": messages,
@@ -256,135 +285,80 @@ async def stream_openrouter(user_id: int, user_text: str, status_message) -> str
 
     full_response = ""
     last_edit_time = time.time()
-    last_text = ""  # Track the last edited text to avoid "Message is not modified" errors
-    edit_interval = 0.7  # seconds between edits, safe from flood limits
+    last_text = ""   # avoid "Message is not modified" duplicates
+    edit_interval = STREAM_EDIT_INTERVAL
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(
-                OPENROUTER_URL, headers=headers, json=payload, timeout=180
-            ) as resp:
+            async with session.post(OPENROUTER_URL, headers=headers, json=payload, timeout=180) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
                     error_msg = f"API error {resp.status}: {error_text[:500]}"
                     await safe_edit(status_message, error_msg)
                     return error_msg
 
-                buffer = ""
                 async for line in resp.content:
                     line_text = line.decode("utf-8").strip()
-
                     if not line_text or line_text.startswith(":"):
                         continue
-
                     if line_text.startswith("data: "):
                         data_str = line_text[6:]
-
                         if data_str == "[DONE]":
                             break
-
                         try:
                             data = json.loads(data_str)
                             if "choices" in data and data["choices"]:
                                 delta = data["choices"][0].get("delta", {})
                                 content = delta.get("content", "")
-
                                 if content:
                                     full_response += content
-
-                                    current_time = time.time()
-                                    if current_time - last_edit_time > edit_interval:
-                                        new_text = full_response
-                                        # Convert to HTML for display
-                                        html_content = markdown_to_telegram_html(new_text)
-                                        if len(html_content) > MAX_MESSAGE_LENGTH:
-                                            html_content = html_content[:MAX_MESSAGE_LENGTH - 100] + "\n\n<i>(continuing...)</i>"
-
-                                        # Only edit if the text actually changed
-                                        if html_content != last_text:
-                                            await safe_edit(status_message, html_content)
-                                            last_text = html_content
-                                        last_edit_time = current_time
+                                    now = time.time()
+                                    if now - last_edit_time > edit_interval:
+                                        # convert and deduplicate
+                                        html = markdown_to_telegram_html(full_response)
+                                        if len(html) > MAX_MESSAGE_LENGTH:
+                                            html = html[:MAX_MESSAGE_LENGTH-50] + "\n\n<i>…continuing</i>"
+                                        if html != last_text:
+                                            await safe_edit(status_message, html)
+                                            last_text = html
+                                        last_edit_time = now
                         except json.JSONDecodeError:
                             continue
 
-                # Final edit with complete response
+                # FINAL EDIT – complete response
                 html_reply = markdown_to_telegram_html(full_response)
-
                 if len(html_reply) > MAX_MESSAGE_LENGTH:
                     first_chunk = html_reply[:MAX_MESSAGE_LENGTH]
                     await safe_edit(status_message, first_chunk)
-
                     remaining = html_reply[MAX_MESSAGE_LENGTH:]
-                    chunks = split_message(remaining)
-                    for chunk in chunks:
-                        try:
-                            await status_message.reply_html(chunk)
-                        except (BadRequest, Flood) as e:
-                            if isinstance(e, Flood):
-                                await asyncio.sleep(e.retry_after + 1)
-                                try:
-                                    await status_message.reply_html(chunk)
-                                except:
-                                    await status_message.reply_text(chunk)
-                            else:
-                                await status_message.reply_text(chunk)
-                        await asyncio.sleep(0.3)
+                    for chunk in split_message(remaining):
+                        await safe_reply(status_message, chunk, do_quote=False)
+                        await asyncio.sleep(CHUNK_SEND_DELAY)
                 else:
                     if html_reply != last_text:
                         await safe_edit(status_message, html_reply)
 
-                # Store in memory
                 add_to_memory(user_id, "user", user_text)
                 add_to_memory(user_id, "assistant", full_response)
-
                 return full_response
 
     except asyncio.TimeoutError:
-        error_msg = "Request timed out."
-        await safe_edit(status_message, error_msg)
-        return error_msg
+        await safe_edit(status_message, "Request timed out.")
+        return "Request timed out."
     except Exception as e:
-        logger.exception("OpenRouter streaming call failed")
-        error_msg = f"Error: {str(e)}"
-        await safe_edit(status_message, error_msg)
-        return error_msg
-
-
-async def safe_edit(message, new_text: str, parse_mode: str = "HTML"):
-    """Edit a Telegram message safely, handling Flood and BadRequest errors."""
-    try:
-        await message.edit_text(new_text, parse_mode=parse_mode)
-    except Flood as e:
-        wait = e.retry_after + 1 if hasattr(e, 'retry_after') else 30
-        logger.warning(f"Flood wait for {wait}s")
-        await asyncio.sleep(wait)
-        try:
-            await message.edit_text(new_text, parse_mode=parse_mode)
-        except Exception as e2:
-            logger.error(f"Retry edit failed: {e2}")
-    except BadRequest as e:
-        if "Message is not modified" in str(e):
-            pass  # ignore, it's a duplicate edit
-        else:
-            # Fallback to plain text
-            try:
-                await message.edit_text(new_text)
-            except Exception:
-                pass
-    except Exception as e:
-        logger.error(f"Edit error: {e}")
+        logger.exception("OpenRouter streaming failed")
+        await safe_edit(status_message, f"Error: {str(e)}")
+        return f"Error: {str(e)}"
 
 # ============================================
 # TELEGRAM BOT HANDLERS
 # ============================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome = (
+    await update.message.reply_html(
         "<b>Hey 👋, I'm DarkGPT. Just send me any text. I give you the raw, uncensored answer.</b>\n\n"
         "/help — more info\n"
         "/clear — reset conversation memory"
     )
-    await update.message.reply_html(welcome)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -405,25 +379,18 @@ async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-
     if is_rate_limited(user_id):
         await update.message.reply_text(
             f"🚫 Slow down! You're sending messages too fast. Please wait {RATE_LIMIT_WINDOW} seconds and try again."
         )
         return
 
-    text = update.message.text
-
-    # Send initial placeholder message for streaming
+    # Create placeholder for streaming
     status_msg = await update.message.reply_text("⏳ DarkGPT is thinking...", do_quote=True)
-
-    # Stream the response
-    await stream_openrouter(user_id, text, status_msg)
+    await stream_openrouter(user_id, update.message.text, status_msg)
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle uploaded files."""
     user_id = update.effective_user.id
-
     if is_rate_limited(user_id):
         await update.message.reply_text(
             f"🚫 Slow down! You're sending messages too fast. Please wait {RATE_LIMIT_WINDOW} seconds and try again."
@@ -436,54 +403,41 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     file_name = file.file_name or "unknown_file"
-    extension = Path(file_name).suffix.lower()
-
-    if extension not in SUPPORTED_TEXT_EXTENSIONS:
+    ext = Path(file_name).suffix.lower()
+    if ext not in SUPPORTED_TEXT_EXTENSIONS:
         await update.message.reply_text(
-            f"❌ Unsupported file type: {extension}\n\n"
-            f"Supported: {', '.join(sorted(SUPPORTED_TEXT_EXTENSIONS))}"
+            f"❌ Unsupported file type: {ext}\nSupported: {', '.join(sorted(SUPPORTED_TEXT_EXTENSIONS))}"
         )
         return
 
-    # Let user know we're processing
     status_msg = await update.message.reply_text(f"📄 Reading {file_name}...", do_quote=True)
 
     try:
-        # Download file
         tg_file = await context.bot.get_file(file.file_id)
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=extension) as tmp:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
             await tg_file.download_to_memory(tmp)
             tmp_path = Path(tmp.name)
 
-        # Extract content
-        file_content = extract_file_content(tmp_path, file_name)
-
-        # Clean up temp file
+        content = extract_file_content(tmp_path, file_name)
         tmp_path.unlink(missing_ok=True)
 
-        if file_content.startswith("[Error") or file_content.startswith("[Unsupported"):
-            await status_msg.edit_text(file_content)
+        if content.startswith("[Error") or content.startswith("[Unsupported"):
+            await safe_edit(status_msg, content)
             return
 
-        # Build the prompt
         caption = update.message.caption or "Analyze this file"
         prompt = (
             f"The user uploaded a file named '{file_name}' and said: \"{caption}\"\n\n"
             f"Here is the file content:\n\n"
-            f"```{extension.lstrip('.')}\n{file_content}\n```\n\n"
+            f"```{ext.lstrip('.')}\n{content}\n```\n\n"
             f"Analyze this file and respond to the user's request."
         )
-
-        # Update status
-        await status_msg.edit_text("⏳ DarkGPT is analyzing the file...")
-
-        # Stream the response
+        await safe_edit(status_msg, "⏳ DarkGPT is analyzing the file...")
         await stream_openrouter(user_id, prompt, status_msg)
 
     except Exception as e:
-        logger.exception(f"File handling failed: {e}")
-        await status_msg.edit_text(f"❌ Error processing file: {str(e)}")
+        logger.exception("File handling error")
+        await safe_edit(status_msg, f"❌ Error processing file: {str(e)}")
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Exception while handling an update:", exc_info=context.error)
@@ -512,18 +466,11 @@ async def main():
         exit(1)
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    # Command handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("clear", clear_history))
-
-    # Text message handler
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    # File upload handler
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
-
     app.add_error_handler(error_handler)
 
     asyncio.create_task(run_web_server())
