@@ -93,11 +93,9 @@ def is_rate_limited(user_id: int) -> bool:
 # ============================================
 # PER-USER CONVERSATION MEMORY
 # ============================================
-# Store a list of (role, content) tuples for each user, excluding jailbreak priming.
 user_memory: Dict[int, List[Tuple[str, str]]] = {}
 
 def trim_memory(user_id: int):
-    """Keep only the last MAX_MEMORY_EXCHANGES * 2 messages (user/assistant pairs)."""
     if user_id not in user_memory:
         return
     max_len = MAX_MEMORY_EXCHANGES * 2
@@ -200,7 +198,6 @@ def split_message(text: str, max_len: int = MAX_MESSAGE_LENGTH) -> List[str]:
 # OPENROUTER CALL — JAILBREAK + MEMORY
 # ============================================
 async def query_openrouter(user_id: int, user_text: str) -> str:
-    # Build messages: jailbreak context, ack, memory, new user message
     messages = [
         {"role": "user", "content": JAILBREAK_CONTEXT},
         {"role": "assistant", "content": ASSISTANT_ACKNOWLEDGMENT},
@@ -303,9 +300,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for i, chunk in enumerate(chunks):
         try:
-            await update.message.reply_html(chunk)
+            # Reply with quote enabled
+            await update.message.reply_html(chunk, do_quote=True)
         except BadRequest:
-            await update.message.reply_text(reply[i:i+MAX_MESSAGE_LENGTH])
+            # Fallback with quote
+            await update.message.reply_text(reply[i:i+MAX_MESSAGE_LENGTH], do_quote=True)
         if i < len(chunks) - 1:
             await asyncio.sleep(0.3)
 
