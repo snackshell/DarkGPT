@@ -336,6 +336,59 @@ def usage_today(rec: Optional[Dict[str, Any]]) -> int:
     return 0
 
 
+def effective_limit(rec: Optional[Dict[str, Any]], global_limit: int) -> int:
+    """A user's personal override if set, otherwise the global limit."""
+    if rec and rec.get("rpd_override") is not None:
+        return int(rec["rpd_override"])
+    return global_limit
+
+
+async def set_user_rpd(identifier: str, value: Optional[int], decided_by: int) -> Optional[Dict[str, Any]]:
+    """Set (or clear, with value=None) a per-user daily limit by Telegram ID or
+    @username. Creates an approved record if the user isn't known yet, so you can
+    pre-grant a higher limit before they arrive."""
+    identifier = identifier.strip()
+    val = None if value is None else int(value)
+
+    if identifier.lstrip("-").isdigit():
+        tid = int(identifier)
+        existing = await get_by_telegram_id(tid)
+        if existing:
+            rows = await _patch({"telegram_id": f"eq.{tid}"}, {"rpd_override": val})
+            clear_cache(tid)
+            return rows[0] if rows else None
+        rec = await _create(
+            {
+                "telegram_id": tid,
+                "status": "approved",
+                "rpd_override": val,
+                "decided_by": decided_by,
+                "decided_at": _now_iso(),
+            }
+        )
+        clear_cache(tid)
+        return rec
+
+    username = identifier.lstrip("@").strip()
+    if not username:
+        return None
+    existing = await get_by_username(username)
+    if existing:
+        rows = await _patch({"id": f"eq.{existing['id']}"}, {"rpd_override": val})
+        if existing.get("telegram_id"):
+            clear_cache(existing["telegram_id"])
+        return rows[0] if rows else None
+    return await _create(
+        {
+            "username": username,
+            "status": "approved",
+            "rpd_override": val,
+            "decided_by": decided_by,
+            "decided_at": _now_iso(),
+        }
+    )
+
+
 # ============================================
 # THE GATE
 # ============================================

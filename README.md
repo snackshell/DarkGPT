@@ -26,7 +26,9 @@ stored in **Supabase**.
 | `/users` | List approved users |
 | `/stats` | Approved / pending / denied counts |
 | `/rpd` | Show the current daily request limit |
-| `/setrpd <n>` | Change the daily request limit (per user) |
+| `/setrpd <n>` | Change the default daily limit (everyone) |
+| `/setuserrpd <id\|@user> <n>` | Give one specific user a custom daily limit |
+| `/clearuserrpd <id\|@user>` | Remove a user's custom limit (back to default) |
 | `/whoami` | Anyone: show your Telegram ID, status and today's usage |
 
 Each approved user may send **20 requests per day** by default (admins are
