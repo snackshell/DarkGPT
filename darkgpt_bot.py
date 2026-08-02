@@ -997,7 +997,9 @@ async def main():
             "Only ADMIN_IDS users will be allowed; everyone else is denied."
         )
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    # concurrent_updates lets many users be served at the same time instead of
+    # queuing behind each other while one person's answer streams.
+    app = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("clear", clear_history))
