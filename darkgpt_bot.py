@@ -530,7 +530,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/users — List approved users\n"
             "/stats — Access counts\n"
             "/rpd — Show daily request limit\n"
-            "/setrpd <n> — Set daily request limit"
+            "/setrpd <n> — Set default daily limit\n"
+            "/setuserrpd <id|@user> <n> — Custom limit for one user\n"
+            "/clearuserrpd <id|@user> — Remove a user's custom limit"
         )
     await update.message.reply_text(text)
 
@@ -863,6 +865,55 @@ async def cmd_setrpd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_setuserrpd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update):
+        return
+    if len(context.args) < 2 or not context.args[1].lstrip("-").isdigit():
+        await update.message.reply_text(
+            "Usage: /setuserrpd <user_id | @username> <number>\n"
+            "Example: /setuserrpd @brother 50"
+        )
+        return
+    identifier, n = context.args[0], int(context.args[1])
+    if n < 1 or n > 100000:
+        await update.message.reply_text("Please pick a number between 1 and 100000.")
+        return
+    try:
+        rec = await ac.set_user_rpd(identifier, n, update.effective_user.id)
+    except Exception:
+        await update.message.reply_text(BACKEND_DOWN_MSG)
+        return
+    if not rec:
+        await update.message.reply_text("❌ Could not set that user's limit.")
+        return
+    who = f"@{rec['username']}" if rec.get("username") else f"ID {rec.get('telegram_id')}"
+    await update.message.reply_html(
+        f"✅ Custom limit set: <b>{html.escape(str(who))}</b> → <b>{n}</b> requests/day."
+    )
+
+
+async def cmd_clearuserrpd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /clearuserrpd <user_id | @username>")
+        return
+    try:
+        rec = await ac.set_user_rpd(context.args[0], None, update.effective_user.id)
+    except Exception:
+        await update.message.reply_text(BACKEND_DOWN_MSG)
+        return
+    if not rec:
+        await update.message.reply_text("❌ Could not update that user.")
+        return
+    who = f"@{rec['username']}" if rec.get("username") else f"ID {rec.get('telegram_id')}"
+    limit = await ac.get_rpd_limit()
+    await update.message.reply_html(
+        f"✅ Custom limit removed: <b>{html.escape(str(who))}</b> is back to the "
+        f"default <b>{limit}</b> requests/day."
+    )
+
+
 async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     usage_line = ""
@@ -873,9 +924,10 @@ async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rec = await ac.peek_status(user.id)
         status = rec.get("status") if rec else "not registered"
         if status == "approved":
-            limit = await ac.get_rpd_limit()
+            limit = ac.effective_limit(rec, await ac.get_rpd_limit())
             used = ac.usage_today(rec)
-            usage_line = f"\nToday: <b>{used}/{limit}</b> requests used"
+            custom = " (custom)" if rec and rec.get("rpd_override") is not None else ""
+            usage_line = f"\nToday: <b>{used}/{limit}</b> requests used{custom}"
     await update.message.reply_html(
         "👤 <b>You</b>\n"
         f"{_describe_user(user)}\n"
@@ -945,7 +997,9 @@ async def main():
             "Only ADMIN_IDS users will be allowed; everyone else is denied."
         )
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    # concurrent_updates lets many users be served at the same time instead of
+    # queuing behind each other while one person's answer streams.
+    app = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("clear", clear_history))
@@ -961,6 +1015,8 @@ async def main():
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("rpd", cmd_rpd))
     app.add_handler(CommandHandler("setrpd", cmd_setrpd))
+    app.add_handler(CommandHandler("setuserrpd", cmd_setuserrpd))
+    app.add_handler(CommandHandler("clearuserrpd", cmd_clearuserrpd))
     app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^(approve|deny):"))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
