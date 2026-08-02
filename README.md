@@ -25,7 +25,12 @@ stored in **Supabase**.
 | `/revoke <id\|@user>` | Remove a user (same as deny) |
 | `/users` | List approved users |
 | `/stats` | Approved / pending / denied counts |
-| `/whoami` | Anyone: show your Telegram ID and status |
+| `/rpd` | Show the current daily request limit |
+| `/setrpd <n>` | Change the daily request limit (per user) |
+| `/whoami` | Anyone: show your Telegram ID, status and today's usage |
+
+Each approved user may send **20 requests per day** by default (admins are
+unlimited). Change the cap live with `/setrpd 50`. Counts reset at 00:00 UTC.
 
 ## Environment variables (Render)
 | Var | Description |

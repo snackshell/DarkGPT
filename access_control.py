@@ -28,6 +28,11 @@ logger = logging.getLogger(__name__)
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 REST_URL = f"{SUPABASE_URL}/rest/v1/bot_users" if SUPABASE_URL else ""
+SETTINGS_URL = f"{SUPABASE_URL}/rest/v1/bot_settings" if SUPABASE_URL else ""
+RPC_URL = f"{SUPABASE_URL}/rest/v1/rpc" if SUPABASE_URL else ""
+
+# Fallback daily request cap if the backend is unreachable / unseeded.
+DEFAULT_RPD = 20
 
 
 def _parse_admin_ids() -> set:
@@ -249,12 +254,86 @@ async def is_admin(tid: int) -> bool:
         return True
     if not is_configured():
         return False
+    rec = _cache_get(tid)  # warm after the access gate ran this turn
+    if rec is None:
+        try:
+            rec = await get_by_telegram_id(tid)
+        except Exception:
+            logger.exception("is_admin lookup failed")
+            return False
+    return bool(rec and rec.get("is_admin"))
+
+
+# ============================================
+# RPD — daily request limit
+# ============================================
+async def _rpc(fn: str, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    async with aiohttp.ClientSession() as s:
+        async with s.post(
+            f"{RPC_URL}/{fn}", headers=_headers(), json=payload, timeout=15
+        ) as r:
+            r.raise_for_status()
+            return await r.json()
+
+
+async def get_rpd_limit() -> int:
+    if not is_configured():
+        return DEFAULT_RPD
     try:
-        rec = await get_by_telegram_id(tid)
-        return bool(rec and rec.get("is_admin"))
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                SETTINGS_URL,
+                headers=_headers(),
+                params={"key": "eq.rpd_limit", "select": "value", "limit": "1"},
+                timeout=15,
+            ) as r:
+                r.raise_for_status()
+                rows = await r.json()
+        if rows:
+            return int(rows[0]["value"])
     except Exception:
-        logger.exception("is_admin lookup failed")
-        return False
+        logger.exception("get_rpd_limit failed")
+    return DEFAULT_RPD
+
+
+async def set_rpd_limit(n: int) -> int:
+    async with aiohttp.ClientSession() as s:
+        async with s.post(
+            SETTINGS_URL,
+            headers=_headers(
+                {"Prefer": "resolution=merge-duplicates,return=representation"}
+            ),
+            params={"on_conflict": "key"},
+            json={"key": "rpd_limit", "value": str(int(n)), "updated_at": _now_iso()},
+            timeout=15,
+        ) as r:
+            r.raise_for_status()
+            rows = await r.json()
+    return int(rows[0]["value"]) if rows else int(n)
+
+
+async def bump_usage(tid: int) -> Tuple[bool, int, int]:
+    """Consume one daily request. Returns (allowed, used_today, limit).
+    Fails open (allowed=True) if the backend errors, so a transient DB issue
+    never blocks an approved user."""
+    try:
+        rows = await _rpc("bump_usage", {"p_telegram_id": tid})
+        if rows:
+            row = rows[0]
+            return (bool(row["allowed"]), int(row["used"]), int(row["lim"]))
+    except Exception:
+        logger.exception("bump_usage failed for %s (failing open)", tid)
+    return (True, 0, DEFAULT_RPD)
+
+
+def usage_today(rec: Optional[Dict[str, Any]]) -> int:
+    """Read a record's request count for the current UTC day (0 if stale)."""
+    if not rec:
+        return 0
+    today = datetime.now(timezone.utc).date().isoformat()
+    if rec.get("usage_date") == today:
+        return int(rec.get("usage_count") or 0)
+    return 0
 
 
 # ============================================

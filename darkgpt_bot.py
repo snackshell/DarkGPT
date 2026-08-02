@@ -528,7 +528,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/grant <id|@user> — Manually add a user\n"
             "/revoke <id|@user> — Remove a user\n"
             "/users — List approved users\n"
-            "/stats — Access counts"
+            "/stats — Access counts\n"
+            "/rpd — Show daily request limit\n"
+            "/setrpd <n> — Set daily request limit"
         )
     await update.message.reply_text(text)
 
@@ -550,6 +552,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if not await check_rpd(update, context, user_id):
+        return
+
     status_msg = await update.message.reply_text("⏳ DarkGPT is thinking...", do_quote=True)
     await stream_openrouter(user_id, update.message.text, status_msg)
 
@@ -561,6 +566,9 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"🚫 Slow down! You're sending messages too fast. Please wait {RATE_LIMIT_WINDOW} seconds and try again."
         )
+        return
+
+    if not await check_rpd(update, context, user_id):
         return
 
     file = update.message.document
@@ -628,6 +636,23 @@ DENIED_MSG = (
     "Your request to use DarkGPT was declined."
 )
 BACKEND_DOWN_MSG = "⚠️ Access system is temporarily unavailable. Please try again in a moment."
+RPD_LIMIT_MSG = (
+    "🚦 <b>Daily limit reached.</b>\n\n"
+    "You've used all <b>{limit}</b> of your requests for today.\n"
+    "Come back tomorrow (resets at 00:00 UTC)."
+)
+
+
+async def check_rpd(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    """Enforce the per-user daily request cap. Admins are exempt. Returns True
+    if the request may proceed."""
+    if await ac.is_admin(user_id):
+        return True
+    allowed, used, limit = await ac.bump_usage(user_id)
+    if not allowed:
+        await update.message.reply_html(RPD_LIMIT_MSG.format(limit=limit))
+        return False
+    return True
 
 
 def _describe_user(user) -> str:
@@ -808,17 +833,54 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_rpd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update):
+        return
+    limit = await ac.get_rpd_limit()
+    await update.message.reply_html(
+        f"🚦 Current daily limit: <b>{limit}</b> requests/user/day.\n"
+        "Change it with /setrpd &lt;number&gt;"
+    )
+
+
+async def cmd_setrpd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update):
+        return
+    if not context.args or not context.args[0].lstrip("-").isdigit():
+        await update.message.reply_text("Usage: /setrpd <number>  (e.g. /setrpd 50)")
+        return
+    n = int(context.args[0])
+    if n < 1 or n > 100000:
+        await update.message.reply_text("Please pick a number between 1 and 100000.")
+        return
+    try:
+        new_limit = await ac.set_rpd_limit(n)
+    except Exception:
+        await update.message.reply_text(BACKEND_DOWN_MSG)
+        return
+    await update.message.reply_html(
+        f"✅ Daily limit updated to <b>{new_limit}</b> requests/user/day."
+    )
+
+
 async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    usage_line = ""
     if await ac.is_admin(user.id):
         status = "admin"
+        usage_line = "\nDaily limit: <b>unlimited</b> (admin)"
     else:
         rec = await ac.peek_status(user.id)
         status = rec.get("status") if rec else "not registered"
+        if status == "approved":
+            limit = await ac.get_rpd_limit()
+            used = ac.usage_today(rec)
+            usage_line = f"\nToday: <b>{used}/{limit}</b> requests used"
     await update.message.reply_html(
         "👤 <b>You</b>\n"
         f"{_describe_user(user)}\n"
         f"Status: <b>{html.escape(str(status))}</b>"
+        f"{usage_line}"
     )
 
 
@@ -897,6 +959,8 @@ async def main():
     app.add_handler(CommandHandler("revoke", cmd_revoke))
     app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("rpd", cmd_rpd))
+    app.add_handler(CommandHandler("setrpd", cmd_setrpd))
     app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^(approve|deny):"))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
