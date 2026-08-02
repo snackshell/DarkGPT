@@ -1,36 +1,40 @@
 #!/usr/bin/env bash
 # =============================================================================
-# DarkGPT — deploy inside an LXD container on your Contabo VPS
+# DarkGPT — deploy inside an LXD container on your VPS
 # Allocates: 2 GB RAM, 2 vCPU, 8 GB disk (inside a 10 GB btrfs pool)
 #
-# RUN THIS ON THE VPS (as root):
-#   1) scp this file to the server, or paste it into a file
-#   2) edit the CONFIG block below (tokens + your Telegram ID)
+# HOW TO USE (secrets never go in this file):
+#   1) Put this script on the VPS
+#   2) Create a file next to it called  darkgpt.secrets.env  with your keys
+#      (copy darkgpt.secrets.env.example and fill it in)
 #   3) chmod +x deploy_darkgpt_lxc.sh && ./deploy_darkgpt_lxc.sh
 # =============================================================================
 set -euo pipefail
 
-# ------------------------- CONFIG — EDIT THESE -------------------------------
+# --- Load your secrets from an untracked file beside this script (or env) ----
+SECRETS_FILE="$(dirname "$0")/darkgpt.secrets.env"
+if [ -f "${SECRETS_FILE}" ]; then
+  set -a; . "${SECRETS_FILE}"; set +a
+fi
+
+# --- Fixed settings (safe to keep in the repo) -------------------------------
 CONTAINER="darkgpt"
 IMAGE="ubuntu:22.04"
 MEM_LIMIT="2GB"
 CPU_LIMIT="2"
-DISK_SIZE="8GB"            # container root cap (pool below is 10GB)
-POOL_SIZE="10"            # GB, btrfs loop pool
+DISK_SIZE="8GB"
+POOL_SIZE="10"
+GIT_BRANCH="${GIT_BRANCH:-claude/chatgpt-access-control-supabase-j6duxk}"
+SUPABASE_URL="${SUPABASE_URL:-https://fxfquwoshovdnqgjejtz.supabase.co}"
 
-# --- The git branch to deploy (merge to main first, or use the feature branch)
-GIT_BRANCH="claude/chatgpt-access-control-supabase-j6duxk"
-# --- Private repo clone URL. Create a GitHub token (repo read scope) and put it here:
-GITHUB_TOKEN="ghp_PUT_YOUR_TOKEN_HERE"
+# --- Required secrets — set these in darkgpt.secrets.env ----------------------
+: "${GITHUB_TOKEN:?Missing GITHUB_TOKEN — set it in darkgpt.secrets.env}"
+: "${BOT_TOKEN:?Missing BOT_TOKEN — set it in darkgpt.secrets.env}"
+: "${OPENROUTER_API_KEY:?Missing OPENROUTER_API_KEY — set it in darkgpt.secrets.env}"
+: "${SUPABASE_SERVICE_KEY:?Missing SUPABASE_SERVICE_KEY — set it in darkgpt.secrets.env}"
+: "${ADMIN_IDS:?Missing ADMIN_IDS — set it in darkgpt.secrets.env}"
+
 GIT_URL="https://${GITHUB_TOKEN}@github.com/snackshell/DarkGPT.git"
-
-# --- App secrets (these become the container's environment) --------------------
-BOT_TOKEN="PUT_TELEGRAM_BOT_TOKEN"
-OPENROUTER_API_KEY="PUT_OPENROUTER_KEY"
-SUPABASE_URL="https://fxfquwoshovdnqgjejtz.supabase.co"
-SUPABASE_SERVICE_KEY="PUT_SUPABASE_SECRET_KEY"     # the sb_secret_... / service_role key
-ADMIN_IDS="PUT_YOUR_TELEGRAM_ID"                    # e.g. 123456789
-# -----------------------------------------------------------------------------
 
 echo ">> [1/7] Installing LXD (if needed)..."
 if ! command -v lxd >/dev/null 2>&1; then
@@ -43,19 +47,16 @@ export PATH="$PATH:/snap/bin"
 echo ">> [2/7] Initialising LXD (10GB btrfs pool, only if not already set up)..."
 if ! lxc storage list --format csv 2>/dev/null | grep -q '^default,'; then
   lxd init --auto --storage-backend btrfs --storage-create-loop "${POOL_SIZE}"
-else
-  echo "   LXD already initialised, reusing existing pool."
 fi
 
 echo ">> [3/7] Launching container '${CONTAINER}'..."
 if lxc info "${CONTAINER}" >/dev/null 2>&1; then
-  echo "   Container exists; stopping to reapply config."
   lxc stop "${CONTAINER}" --force || true
 else
   lxc launch "${IMAGE}" "${CONTAINER}"
 fi
 
-echo ">> [4/7] Applying resource limits (RAM ${MEM_LIMIT}, CPU ${CPU_LIMIT}, disk ${DISK_SIZE})..."
+echo ">> [4/7] Applying limits (RAM ${MEM_LIMIT}, CPU ${CPU_LIMIT}, disk ${DISK_SIZE})..."
 lxc config set "${CONTAINER}" limits.memory "${MEM_LIMIT}"
 lxc config set "${CONTAINER}" limits.memory.enforce hard
 lxc config set "${CONTAINER}" limits.cpu "${CPU_LIMIT}"
@@ -121,7 +122,7 @@ systemctl enable --now darkgpt.service'
 echo
 echo "============================================================"
 echo " DarkGPT deployed in container '${CONTAINER}'."
-echo " Check logs:   lxc exec ${CONTAINER} -- journalctl -u darkgpt -f"
-echo " Restart:      lxc exec ${CONTAINER} -- systemctl restart darkgpt"
-echo " Update code:  lxc exec ${CONTAINER} -- bash -c 'cd /opt/DarkGPT && git pull && systemctl restart darkgpt'"
+echo " Logs:    lxc exec ${CONTAINER} -- journalctl -u darkgpt -f"
+echo " Restart: lxc exec ${CONTAINER} -- systemctl restart darkgpt"
+echo " Update:  lxc exec ${CONTAINER} -- bash -c 'cd /opt/DarkGPT && git pull && systemctl restart darkgpt'"
 echo "============================================================"
