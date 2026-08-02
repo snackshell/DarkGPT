@@ -36,6 +36,82 @@ SUPABASE_URL="${SUPABASE_URL:-https://fxfquwoshovdnqgjejtz.supabase.co}"
 
 GIT_URL="https://${GITHUB_TOKEN}@github.com/snackshell/DarkGPT.git"
 
+# -----------------------------------------------------------------------------
+# Network self-heal for hosts that also run Docker.
+# Docker's firewall breaks DHCP + forwarding on LXD's bridge, so the container
+# gets no IPv4. We fix the host firewall/NAT (persistently, survives reboot)
+# and give the container a static IP via netplan (survives container restarts).
+# -----------------------------------------------------------------------------
+harden_container_network() {
+  echo ">> Ensuring container networking (Docker/LXD fix)..."
+
+  cat > /etc/sysctl.d/99-darkgpt-lxd.conf <<'SYSEOF'
+net.ipv4.ip_forward=1
+net.bridge.bridge-nf-call-iptables=0
+net.bridge.bridge-nf-call-ip6tables=0
+SYSEOF
+  modprobe br_netfilter 2>/dev/null || true
+  sysctl --system >/dev/null 2>&1 || true
+
+  local gwcidr gw cidr net3 subnet static_ip
+  gwcidr="$(lxc network get lxdbr0 ipv4.address 2>/dev/null)"   # e.g. 10.157.144.1/24
+  gw="${gwcidr%/*}"
+  cidr="${gwcidr#*/}"
+  if [ -z "${gw}" ] || [ -z "${cidr}" ]; then
+    echo "   WARNING: couldn't read lxdbr0 address; skipping static network config."
+    return 0
+  fi
+  net3="$(echo "${gw}" | cut -d. -f1-3)"
+  subnet="${net3}.0/${cidr}"
+  static_ip="${net3}.50"
+
+  # Boot-persistent host firewall/NAT fix (Docker resets FORWARD=DROP on reboot).
+  cat > /usr/local/sbin/darkgpt-netfix.sh <<NETFIXEOF
+#!/usr/bin/env bash
+export PATH="\$PATH:/snap/bin"
+iptables -P FORWARD ACCEPT
+iptables -C DOCKER-USER -i lxdbr0 -j ACCEPT 2>/dev/null || iptables -I DOCKER-USER -i lxdbr0 -j ACCEPT 2>/dev/null || true
+iptables -C DOCKER-USER -o lxdbr0 -j ACCEPT 2>/dev/null || iptables -I DOCKER-USER -o lxdbr0 -j ACCEPT 2>/dev/null || true
+iptables -t nat -C POSTROUTING -s ${subnet} ! -o lxdbr0 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s ${subnet} ! -o lxdbr0 -j MASQUERADE
+NETFIXEOF
+  chmod +x /usr/local/sbin/darkgpt-netfix.sh
+  /usr/local/sbin/darkgpt-netfix.sh || true
+
+  cat > /etc/systemd/system/darkgpt-netfix.service <<'UNITEOF'
+[Unit]
+Description=DarkGPT container network fix (Docker/LXD)
+After=docker.service snap.lxd.daemon.service network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/darkgpt-netfix.sh
+[Install]
+WantedBy=multi-user.target
+UNITEOF
+  systemctl daemon-reload
+  systemctl enable darkgpt-netfix.service >/dev/null 2>&1 || true
+
+  # Persistent static IP inside the container (DHCP is unreliable under Docker).
+  lxc exec "${CONTAINER}" -- bash -c "mkdir -p /etc/cloud/cloud.cfg.d && echo 'network: {config: disabled}' > /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg" 2>/dev/null || true
+  lxc exec "${CONTAINER}" -- bash -c "cat > /etc/netplan/99-darkgpt.yaml <<NETEOF
+network:
+  version: 2
+  ethernets:
+    eth0:
+      dhcp4: false
+      addresses: [${static_ip}/${cidr}]
+      routes:
+        - to: default
+          via: ${gw}
+      nameservers:
+        addresses: [8.8.8.8, 1.1.1.1]
+NETEOF
+chmod 600 /etc/netplan/99-darkgpt.yaml
+netplan apply" 2>/dev/null || true
+  sleep 4
+}
+
 echo ">> [1/7] Installing LXD (if needed)..."
 if ! command -v lxd >/dev/null 2>&1; then
   apt-get update -y
@@ -63,6 +139,8 @@ lxc config set "${CONTAINER}" limits.cpu "${CPU_LIMIT}"
 lxc config device override "${CONTAINER}" root size="${DISK_SIZE}" 2>/dev/null || \
   lxc config device set "${CONTAINER}" root size="${DISK_SIZE}"
 lxc start "${CONTAINER}" 2>/dev/null || true
+
+harden_container_network
 
 echo ">> Waiting for container network..."
 for i in $(seq 1 30); do
