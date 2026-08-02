@@ -7,11 +7,12 @@ import time
 import json
 import html
 import tempfile
+from io import BytesIO
 from pathlib import Path
 from typing import List, Dict, Tuple
 import aiohttp
 from aiohttp import web
-from telegram import Update, constants, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, constants, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.error import BadRequest, RetryAfter
 from telegram.ext import (
     Application,
@@ -45,6 +46,51 @@ MAX_MEMORY_EXCHANGES = 5
 
 STREAM_EDIT_INTERVAL = 1.2
 CHUNK_SEND_DELAY = 0.8
+
+# When a generated code block is at least this big, send it as a real file
+# (.py/.js/.html/…) instead of pasting it into a length-limited Telegram message.
+CODE_FILE_MIN_CHARS = 900
+CODE_FILE_MIN_LINES = 15
+
+# Fenced-code language tag -> file extension.
+LANG_EXT = {
+    "python": ".py", "py": ".py", "python3": ".py",
+    "javascript": ".js", "js": ".js", "node": ".js", "nodejs": ".js",
+    "typescript": ".ts", "ts": ".ts",
+    "html": ".html", "htm": ".html", "xhtml": ".html",
+    "css": ".css", "scss": ".scss",
+    "php": ".php",
+    "c": ".c", "h": ".h",
+    "cpp": ".cpp", "c++": ".cpp", "cc": ".cpp",
+    "java": ".java",
+    "ruby": ".rb", "rb": ".rb",
+    "go": ".go", "golang": ".go",
+    "rust": ".rs", "rs": ".rs",
+    "sql": ".sql",
+    "bash": ".sh", "sh": ".sh", "shell": ".sh", "zsh": ".sh",
+    "json": ".json", "xml": ".xml",
+    "yaml": ".yaml", "yml": ".yaml",
+    "kotlin": ".kt", "kt": ".kt",
+    "swift": ".swift",
+    "csharp": ".cs", "cs": ".cs", "c#": ".cs",
+    "dart": ".dart", "r": ".r", "perl": ".pl", "lua": ".lua",
+    "dockerfile": "Dockerfile", "makefile": "Makefile",
+    "toml": ".toml", "ini": ".ini",
+}
+
+# Nice default filename per extension.
+FILENAME_BY_EXT = {
+    ".py": "script.py", ".js": "script.js", ".ts": "script.ts",
+    ".html": "index.html", ".css": "styles.css", ".scss": "styles.scss",
+    ".php": "index.php", ".c": "main.c", ".cpp": "main.cpp", ".h": "header.h",
+    ".java": "Main.java", ".rb": "script.rb", ".go": "main.go", ".rs": "main.rs",
+    ".sql": "query.sql", ".sh": "script.sh", ".json": "data.json",
+    ".xml": "data.xml", ".yaml": "config.yaml", ".kt": "Main.kt",
+    ".swift": "main.swift", ".cs": "Program.cs", ".dart": "main.dart",
+    ".r": "script.r", ".pl": "script.pl", ".lua": "script.lua",
+    ".toml": "config.toml", ".ini": "config.ini",
+    "Dockerfile": "Dockerfile", "Makefile": "Makefile", ".txt": "output.txt",
+}
 
 SUPPORTED_TEXT_EXTENSIONS = {
     ".txt", ".py", ".md", ".json", ".yaml", ".yml",
@@ -254,6 +300,116 @@ async def safe_reply(message, text: str, parse_mode: str = "HTML", do_quote: boo
         return None
 
 # ============================================
+# SMART CODE-AS-FILE DELIVERY
+# ============================================
+def extract_code_blocks(text: str) -> List[Dict]:
+    """Find fenced ``` code blocks, capturing their language tag, body and
+    exact span in the source text."""
+    blocks = []
+    for m in re.finditer(r'```([^\n`]*)\n(.*?)```', text, flags=re.DOTALL):
+        lang = (m.group(1) or "").strip().lower()
+        code = m.group(2)
+        if code.endswith("\n"):
+            code = code[:-1]
+        blocks.append({"lang": lang, "code": code, "span": m.span()})
+    return blocks
+
+
+def _is_big_enough_for_file(code: str) -> bool:
+    return len(code) >= CODE_FILE_MIN_CHARS or (code.count("\n") + 1) >= CODE_FILE_MIN_LINES
+
+
+def _ext_for_lang(lang: str) -> str:
+    return LANG_EXT.get(lang, ".txt")
+
+
+def _filename_for(ext: str, index: int) -> str:
+    default = FILENAME_BY_EXT.get(ext, f"output{ext}")
+    if index <= 1:
+        return default
+    if "." in default:
+        stem, _, e = default.rpartition(".")
+        return f"{stem}_{index}.{e}"
+    return f"{default}_{index}"
+
+
+async def send_code_file(message, filename: str, code: str):
+    """Send a code block as a downloadable document, with a text fallback."""
+    try:
+        bio = BytesIO(code.encode("utf-8"))
+        bio.name = filename
+        await message.reply_document(
+            document=InputFile(bio, filename=filename),
+            caption=f"📄 {filename}",
+        )
+    except Exception:
+        logger.exception("Failed to send code file %s; falling back to text", filename)
+        for chunk in split_message(code):
+            await safe_reply(message, f"<pre><code>{html.escape(chunk)}</code></pre>", do_quote=False)
+            await asyncio.sleep(CHUNK_SEND_DELAY)
+
+
+async def deliver_response(status_message, full_response: str, last_text: str):
+    """Final delivery of a completed answer. Large code blocks are sent as real
+    files (.py/.js/.html/…); everything else keeps the normal text behavior."""
+    blocks = extract_code_blocks(full_response)
+    file_blocks = [b for b in blocks if _is_big_enough_for_file(b["code"])]
+
+    # No sizeable code → original text behavior, unchanged.
+    if not file_blocks:
+        html_reply = markdown_to_telegram_html(full_response)
+        if len(html_reply) > MAX_MESSAGE_LENGTH:
+            first_chunk = html_reply[:MAX_MESSAGE_LENGTH]
+            await safe_edit(status_message, first_chunk)
+            for chunk in split_message(html_reply[MAX_MESSAGE_LENGTH:]):
+                await safe_reply(status_message, chunk, do_quote=False)
+                await asyncio.sleep(CHUNK_SEND_DELAY)
+        else:
+            if html_reply != last_text:
+                await safe_edit(status_message, html_reply)
+        return
+
+    # Rebuild the text with big code blocks pulled out into files.
+    pieces: List[str] = []
+    cursor = 0
+    ext_counts: Dict[str, int] = {}
+    files_to_send: List[Tuple[str, str]] = []
+    file_spans = {id(b) for b in file_blocks}
+
+    for b in blocks:
+        start, end = b["span"]
+        pieces.append(full_response[cursor:start])
+        if id(b) in file_spans:
+            ext = _ext_for_lang(b["lang"])
+            ext_counts[ext] = ext_counts.get(ext, 0) + 1
+            fname = _filename_for(ext, ext_counts[ext])
+            files_to_send.append((fname, b["code"]))
+            pieces.append(f"\n📎 `{fname}` — sent as a file below\n")
+        else:
+            pieces.append(full_response[start:end])  # keep small snippets inline
+        cursor = end
+    pieces.append(full_response[cursor:])
+
+    text_part = "".join(pieces).strip()
+
+    if text_part:
+        html_reply = markdown_to_telegram_html(text_part)
+        if len(html_reply) > MAX_MESSAGE_LENGTH:
+            await safe_edit(status_message, html_reply[:MAX_MESSAGE_LENGTH])
+            for chunk in split_message(html_reply[MAX_MESSAGE_LENGTH:]):
+                await safe_reply(status_message, chunk, do_quote=False)
+                await asyncio.sleep(CHUNK_SEND_DELAY)
+        else:
+            await safe_edit(status_message, html_reply)
+    else:
+        await safe_edit(status_message, "📎 Here you go:")
+
+    for fname, code in files_to_send:
+        await send_code_file(status_message, fname, code)
+        await asyncio.sleep(CHUNK_SEND_DELAY)
+
+
+# ============================================
 # OPENROUTER STREAMING CALL
 # ============================================
 async def stream_openrouter(user_id: int, user_text: str, status_message) -> str:
@@ -323,18 +479,8 @@ async def stream_openrouter(user_id: int, user_text: str, status_message) -> str
                         except json.JSONDecodeError:
                             continue
 
-                # Final edit
-                html_reply = markdown_to_telegram_html(full_response)
-                if len(html_reply) > MAX_MESSAGE_LENGTH:
-                    first_chunk = html_reply[:MAX_MESSAGE_LENGTH]
-                    await safe_edit(status_message, first_chunk)
-                    remaining = html_reply[MAX_MESSAGE_LENGTH:]
-                    for chunk in split_message(remaining):
-                        await safe_reply(status_message, chunk, do_quote=False)
-                        await asyncio.sleep(CHUNK_SEND_DELAY)
-                else:
-                    if html_reply != last_text:
-                        await safe_edit(status_message, html_reply)
+                # Final delivery: large code blocks go out as real files.
+                await deliver_response(status_message, full_response, last_text)
 
                 add_to_memory(user_id, "user", user_text)
                 add_to_memory(user_id, "assistant", full_response)
