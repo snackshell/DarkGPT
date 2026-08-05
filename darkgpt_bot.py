@@ -410,8 +410,8 @@ async def deliver_response(status_message, full_response: str, last_text: str):
         return
 
     text_part = re.sub(r"\n{3,}", "\n\n", "".join(out_parts)).strip()
-    if not text_part:
-        text_part = "✅ Here's your file 👇"
+    header = "✅ **Your file is ready!**"
+    text_part = f"{header}\n\n{text_part}" if text_part else header
     await _send_text_only(status_message, text_part)
 
     for fname, code in files_to_send:
