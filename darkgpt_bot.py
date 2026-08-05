@@ -40,6 +40,16 @@ MODEL = "deepseek/deepseek-v4-flash-0731"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 MAX_MESSAGE_LENGTH = 4096
 
+# Output length. The model caps a single response at MAX_TOKENS; when it hits
+# that cap mid-answer we automatically ask it to continue, up to
+# MAX_CONTINUATIONS times — so long files (1000+ lines) come out complete.
+MAX_TOKENS = 8192
+MAX_CONTINUATIONS = 6
+
+# Bounded worker pool: how many AI generations run at the same time. Extra
+# requests wait in a queue instead of overloading the box / the API.
+GENERATION_WORKERS = 4
+
 RATE_LIMIT_MAX = 5
 RATE_LIMIT_WINDOW = 10  # seconds
 MAX_MEMORY_EXCHANGES = 5
@@ -410,9 +420,21 @@ async def deliver_response(status_message, full_response: str, last_text: str):
 
 
 # ============================================
-# OPENROUTER STREAMING CALL
+# OPENROUTER — shared helpers, worker queue, continuation
 # ============================================
-async def stream_openrouter(user_id: int, user_text: str, status_message) -> str:
+# Bounded pool of concurrent AI generations. Requests beyond GENERATION_WORKERS
+# wait here (a queue) instead of hammering the box or the API all at once.
+generation_pool = asyncio.Semaphore(GENERATION_WORKERS)
+
+CONTINUE_NUDGE = (
+    "Continue the previous response exactly where it stopped. Do not repeat any "
+    "earlier content, do not add any commentary — just continue the output."
+)
+
+
+def build_messages(user_id: int, user_text: str) -> List[Dict]:
+    """Assemble the message list (jailbreak context + memory + prompt).
+    Unchanged from before — the model sees exactly the same thing."""
     messages = [
         {"role": "user", "content": JAILBREAK_CONTEXT},
         {"role": "assistant", "content": ASSISTANT_ACKNOWLEDGMENT},
@@ -422,19 +444,90 @@ async def stream_openrouter(user_id: int, user_text: str, status_message) -> str
             messages.append({"role": role, "content": content})
     messages.append({"role": "system", "content": SYSTEM_OVERRIDE})
     messages.append({"role": "user", "content": user_text})
+    return messages
 
-    headers = {
+
+def _openrouter_headers() -> Dict[str, str]:
+    return {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
         "HTTP-Referer": "https://t.me/selamdark_bot",
         "X-Title": "DarkGPT Bot",
     }
+
+
+async def _call_once(messages: List[Dict]) -> Tuple[str, str]:
+    """One non-streaming completion. Returns (content, finish_reason)."""
     payload = {
         "model": MODEL,
         "messages": messages,
         "temperature": 1.0,
         "top_p": 1.0,
-        "max_tokens": 4096,
+        "max_tokens": MAX_TOKENS,
+        "stream": False,
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(OPENROUTER_URL, headers=_openrouter_headers(), json=payload, timeout=300) as resp:
+            if resp.status != 200:
+                error_text = await resp.text()
+                raise RuntimeError(f"API error {resp.status}: {error_text[:400]}")
+            data = await resp.json()
+            choice = data["choices"][0]
+            return (choice["message"].get("content") or "", choice.get("finish_reason") or "stop")
+
+
+async def generate_full(user_id: int, user_text: str) -> str:
+    """Non-streaming generation that auto-continues when the model hits its
+    output cap, so long files come out complete. Used for code/file requests."""
+    messages = build_messages(user_id, user_text)
+    full = ""
+    for attempt in range(MAX_CONTINUATIONS + 1):
+        content, finish = await _call_once(messages)
+        full += content
+        if finish == "length" and attempt < MAX_CONTINUATIONS:
+            messages.append({"role": "assistant", "content": content})
+            messages.append({"role": "user", "content": CONTINUE_NUDGE})
+            continue
+        break
+    return full
+
+
+# --- Detecting "please write me code / a file" ------------------------------
+CODE_REQUEST_HINTS = (
+    "script", "code", "program", "website", "webpage", "web page", "web site",
+    "clone", "landing page", "html", "css", "javascript", "typescript",
+    "python", " php", " java", "golang", " rust", "react", "node", "sql query",
+    "send me the file", "give me the file", "as a file", "write me", "create me",
+    "build me", "make me a", "full code", "complete code", "boilerplate",
+    ".py", ".html", ".js", ".css", ".php", ".cpp", ".java",
+)
+
+
+def looks_like_code_request(text: str) -> bool:
+    t = (text or "").lower()
+    return any(h in t for h in CODE_REQUEST_HINTS)
+
+
+async def _maybe_queue_notice(status_message):
+    """If all workers are busy, tell the user they're queued."""
+    if generation_pool.locked():
+        await safe_edit(
+            status_message,
+            "⏳ <b>Busy right now</b> — you're in the queue, I'll start on yours in a moment…",
+        )
+
+
+# ============================================
+# OPENROUTER STREAMING CALL (normal chat)
+# ============================================
+async def stream_openrouter(user_id: int, user_text: str, status_message) -> str:
+    messages = build_messages(user_id, user_text)
+    payload = {
+        "model": MODEL,
+        "messages": messages,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "max_tokens": MAX_TOKENS,
         "stream": True,
     }
 
@@ -442,10 +535,11 @@ async def stream_openrouter(user_id: int, user_text: str, status_message) -> str
     last_edit_time = time.time()
     last_text = ""
     edit_interval = STREAM_EDIT_INTERVAL
+    finish_reason = "stop"
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(OPENROUTER_URL, headers=headers, json=payload, timeout=180) as resp:
+            async with session.post(OPENROUTER_URL, headers=_openrouter_headers(), json=payload, timeout=300) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
                     error_msg = f"API error {resp.status}: {error_text[:500]}"
@@ -463,7 +557,10 @@ async def stream_openrouter(user_id: int, user_text: str, status_message) -> str
                         try:
                             data = json.loads(data_str)
                             if "choices" in data and data["choices"]:
-                                delta = data["choices"][0].get("delta", {})
+                                choice = data["choices"][0]
+                                if choice.get("finish_reason"):
+                                    finish_reason = choice["finish_reason"]
+                                delta = choice.get("delta", {})
                                 content = delta.get("content", "")
                                 if content:
                                     full_response += content
@@ -479,12 +576,24 @@ async def stream_openrouter(user_id: int, user_text: str, status_message) -> str
                         except json.JSONDecodeError:
                             continue
 
-                # Final delivery: large code blocks go out as real files.
-                await deliver_response(status_message, full_response, last_text)
+        # If the model stopped only because it hit the length cap, keep going
+        # (non-streaming) until the answer is actually complete.
+        if finish_reason == "length":
+            cont_messages = messages + [{"role": "assistant", "content": full_response}]
+            for _ in range(MAX_CONTINUATIONS):
+                cont_messages.append({"role": "user", "content": CONTINUE_NUDGE})
+                piece, finish_reason = await _call_once(cont_messages)
+                full_response += piece
+                cont_messages.append({"role": "assistant", "content": piece})
+                if finish_reason != "length":
+                    break
 
-                add_to_memory(user_id, "user", user_text)
-                add_to_memory(user_id, "assistant", full_response)
-                return full_response
+        # Final delivery: large code blocks go out as real files.
+        await deliver_response(status_message, full_response, last_text)
+
+        add_to_memory(user_id, "user", user_text)
+        add_to_memory(user_id, "assistant", full_response)
+        return full_response
 
     except asyncio.TimeoutError:
         await safe_edit(status_message, "Request timed out.")
@@ -493,6 +602,28 @@ async def stream_openrouter(user_id: int, user_text: str, status_message) -> str
         logger.exception("OpenRouter streaming failed")
         await safe_edit(status_message, f"Error: {str(e)}")
         return f"Error: {str(e)}"
+
+
+# ============================================
+# CODE / FILE REQUESTS (no streaming — write, then send the file)
+# ============================================
+async def generate_code_and_send(user_id: int, user_text: str, status_message):
+    """Generate the whole answer in the background (with auto-continuation for
+    long files), then deliver: explanation as text + the code as a file. No
+    live streaming, so nothing gets cut off mid-way on screen."""
+    try:
+        full_response = await generate_full(user_id, user_text)
+    except asyncio.TimeoutError:
+        await safe_edit(status_message, "Request timed out.")
+        return
+    except Exception as e:
+        logger.exception("Code generation failed")
+        await safe_edit(status_message, f"Error: {str(e)}")
+        return
+
+    await deliver_response(status_message, full_response, "")
+    add_to_memory(user_id, "user", user_text)
+    add_to_memory(user_id, "assistant", full_response)
 
 # ============================================
 # TELEGRAM BOT HANDLERS
@@ -557,8 +688,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_rpd(update, context, user_id):
         return
 
-    status_msg = await update.message.reply_text("⏳ DarkGPT is thinking...", do_quote=True)
-    await stream_openrouter(user_id, update.message.text, status_msg)
+    user_text = update.message.text
+    if looks_like_code_request(user_text):
+        status_msg = await update.message.reply_text(
+            "⏳ DarkGPT is writing your file… long ones can take a little while.",
+            do_quote=True,
+        )
+        await _maybe_queue_notice(status_msg)
+        async with generation_pool:
+            await safe_edit(status_msg, "✍️ Writing your code…")
+            await generate_code_and_send(user_id, user_text, status_msg)
+    else:
+        status_msg = await update.message.reply_text("⏳ DarkGPT is thinking...", do_quote=True)
+        await _maybe_queue_notice(status_msg)
+        async with generation_pool:
+            await stream_openrouter(user_id, user_text, status_msg)
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_access(update, context):
@@ -609,7 +753,9 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Analyze this file and respond to the user's request."
         )
         await safe_edit(status_msg, "⏳ DarkGPT is analyzing the file...")
-        await stream_openrouter(user_id, prompt, status_msg)
+        await _maybe_queue_notice(status_msg)
+        async with generation_pool:
+            await stream_openrouter(user_id, prompt, status_msg)
 
     except Exception as e:
         logger.exception("File handling error")
