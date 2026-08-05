@@ -359,60 +359,60 @@ async def send_code_file(message, filename: str, code: str):
             await asyncio.sleep(CHUNK_SEND_DELAY)
 
 
+async def _send_text_only(status_message, text: str, last_text: str = ""):
+    html_reply = markdown_to_telegram_html(text)
+    if len(html_reply) > MAX_MESSAGE_LENGTH:
+        await safe_edit(status_message, html_reply[:MAX_MESSAGE_LENGTH])
+        for chunk in split_message(html_reply[MAX_MESSAGE_LENGTH:]):
+            await safe_reply(status_message, chunk, do_quote=False)
+            await asyncio.sleep(CHUNK_SEND_DELAY)
+    elif html_reply != last_text:
+        await safe_edit(status_message, html_reply)
+
+
 async def deliver_response(status_message, full_response: str, last_text: str):
-    """Final delivery of a completed answer. Large code blocks are sent as real
-    files (.py/.js/.html/…); everything else keeps the normal text behavior."""
-    blocks = extract_code_blocks(full_response)
-    file_blocks = [b for b in blocks if _is_big_enough_for_file(b["code"])]
-
-    # No sizeable code → original text behavior, unchanged.
-    if not file_blocks:
-        html_reply = markdown_to_telegram_html(full_response)
-        if len(html_reply) > MAX_MESSAGE_LENGTH:
-            first_chunk = html_reply[:MAX_MESSAGE_LENGTH]
-            await safe_edit(status_message, first_chunk)
-            for chunk in split_message(html_reply[MAX_MESSAGE_LENGTH:]):
-                await safe_reply(status_message, chunk, do_quote=False)
-                await asyncio.sleep(CHUNK_SEND_DELAY)
-        else:
-            if html_reply != last_text:
-                await safe_edit(status_message, html_reply)
-        return
-
-    # Rebuild the text with big code blocks pulled out into files.
-    pieces: List[str] = []
-    cursor = 0
-    ext_counts: Dict[str, int] = {}
+    """Final delivery. Big code blocks are pulled OUT of the chat and sent as
+    real files; only a short description stays in the message. Parsing is done
+    by splitting on ``` so it also handles an unclosed final fence (which can
+    happen after auto-continuation) — that trailing code still becomes a file
+    instead of being dumped into the chat."""
+    segments = full_response.split("```")
+    out_parts: List[str] = []
     files_to_send: List[Tuple[str, str]] = []
-    file_spans = {id(b) for b in file_blocks}
+    ext_counts: Dict[str, int] = {}
 
-    for b in blocks:
-        start, end = b["span"]
-        pieces.append(full_response[cursor:start])
-        if id(b) in file_spans:
-            ext = _ext_for_lang(b["lang"])
+    for i, seg in enumerate(segments):
+        if i % 2 == 0:
+            out_parts.append(seg)  # prose between/around code fences
+            continue
+        # Odd segments are code (the text between a pair of ``` — or after a
+        # lone opening ``` if the model never closed it).
+        nl = seg.find("\n")
+        if nl == -1:
+            lang, code = "", seg
+        else:
+            lang, code = seg[:nl].strip().lower(), seg[nl + 1:]
+        if code.endswith("\n"):
+            code = code[:-1]
+
+        if _is_big_enough_for_file(code):
+            ext = _ext_for_lang(lang)
             ext_counts[ext] = ext_counts.get(ext, 0) + 1
             fname = _filename_for(ext, ext_counts[ext])
-            files_to_send.append((fname, b["code"]))
-            pieces.append(f"\n📎 `{fname}` — sent as a file below\n")
-        else:
-            pieces.append(full_response[start:end])  # keep small snippets inline
-        cursor = end
-    pieces.append(full_response[cursor:])
+            files_to_send.append((fname, code))
+            out_parts.append(f"\n📎 `{fname}` — attached below\n")
+        elif code.strip():
+            out_parts.append(f"```{lang}\n{code}\n```")  # short snippet stays inline
 
-    text_part = "".join(pieces).strip()
+    # No sizeable code anywhere → plain text behaviour, unchanged.
+    if not files_to_send:
+        await _send_text_only(status_message, full_response, last_text)
+        return
 
-    if text_part:
-        html_reply = markdown_to_telegram_html(text_part)
-        if len(html_reply) > MAX_MESSAGE_LENGTH:
-            await safe_edit(status_message, html_reply[:MAX_MESSAGE_LENGTH])
-            for chunk in split_message(html_reply[MAX_MESSAGE_LENGTH:]):
-                await safe_reply(status_message, chunk, do_quote=False)
-                await asyncio.sleep(CHUNK_SEND_DELAY)
-        else:
-            await safe_edit(status_message, html_reply)
-    else:
-        await safe_edit(status_message, "📎 Here you go:")
+    text_part = re.sub(r"\n{3,}", "\n\n", "".join(out_parts)).strip()
+    if not text_part:
+        text_part = "✅ Here's your file 👇"
+    await _send_text_only(status_message, text_part)
 
     for fname, code in files_to_send:
         await send_code_file(status_message, fname, code)
@@ -517,6 +517,18 @@ async def _maybe_queue_notice(status_message):
         )
 
 
+# Detached background jobs (code generation). Keeping a reference stops them
+# from being garbage-collected mid-run.
+_background_jobs: set = set()
+
+
+def spawn_background(coro):
+    task = asyncio.create_task(coro)
+    _background_jobs.add(task)
+    task.add_done_callback(_background_jobs.discard)
+    return task
+
+
 # ============================================
 # OPENROUTER STREAMING CALL (normal chat)
 # ============================================
@@ -608,11 +620,21 @@ async def stream_openrouter(user_id: int, user_text: str, status_message) -> str
 # CODE / FILE REQUESTS (no streaming — write, then send the file)
 # ============================================
 async def generate_code_and_send(user_id: int, user_text: str, status_message):
-    """Generate the whole answer in the background (with auto-continuation for
-    long files), then deliver: explanation as text + the code as a file. No
-    live streaming, so nothing gets cut off mid-way on screen."""
+    """A self-contained code/file job, run detached in the background. It waits
+    for a free worker (queue), writes the whole answer with auto-continuation
+    for long files, then delivers a short description + the code as a file. No
+    live streaming, and — because it runs as its own task — sending another
+    message can't interrupt it; the file always arrives when it's done."""
     try:
-        full_response = await generate_full(user_id, user_text)
+        if generation_pool.locked():
+            await safe_edit(
+                status_message,
+                "⏳ <b>Queued</b> — I'll start writing your file as soon as a worker is free. "
+                "You can keep chatting.",
+            )
+        async with generation_pool:
+            await safe_edit(status_message, "✍️ Writing your file… (this keeps going even if you send more messages)")
+            full_response = await generate_full(user_id, user_text)
     except asyncio.TimeoutError:
         await safe_edit(status_message, "Request timed out.")
         return
@@ -691,13 +713,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     if looks_like_code_request(user_text):
         status_msg = await update.message.reply_text(
-            "⏳ DarkGPT is writing your file… long ones can take a little while.",
+            "🧾 Got it — writing your file in the background.\n"
+            "You can keep chatting; I'll send it here the moment it's ready.",
             do_quote=True,
         )
-        await _maybe_queue_notice(status_msg)
-        async with generation_pool:
-            await safe_edit(status_msg, "✍️ Writing your code…")
-            await generate_code_and_send(user_id, user_text, status_msg)
+        # Detached job: nothing you send afterwards can interrupt it.
+        spawn_background(generate_code_and_send(user_id, user_text, status_msg))
     else:
         status_msg = await update.message.reply_text("⏳ DarkGPT is thinking...", do_quote=True)
         await _maybe_queue_notice(status_msg)
