@@ -6,6 +6,7 @@ import re
 import time
 import json
 import html
+import base64
 import tempfile
 from io import BytesIO
 from pathlib import Path
@@ -37,8 +38,19 @@ PORT = int(os.environ.get("PORT", "8080"))
 # CONSTANTS
 # ============================================
 MODEL = "deepseek/deepseek-v4-flash-0731"
+# Model used when the user sends an image. Defaults to the main model; override
+# with the VISION_MODEL env var if your main model can't see images (set it to
+# any vision-capable OpenRouter model).
+VISION_MODEL = os.environ.get("VISION_MODEL", MODEL)
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 MAX_MESSAGE_LENGTH = 4096
+
+# Image types the bot will send to the vision model.
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
+IMAGE_MIME = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+    ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp",
+}
 
 # Output length. The model caps a single response at MAX_TOKENS; when it hits
 # that cap mid-answer we automatically ask it to continue, up to
@@ -456,10 +468,10 @@ def _openrouter_headers() -> Dict[str, str]:
     }
 
 
-async def _call_once(messages: List[Dict]) -> Tuple[str, str]:
+async def _call_once(messages: List[Dict], model: str = MODEL) -> Tuple[str, str]:
     """One non-streaming completion. Returns (content, finish_reason)."""
     payload = {
-        "model": MODEL,
+        "model": model,
         "messages": messages,
         "temperature": 1.0,
         "top_p": 1.0,
@@ -647,6 +659,55 @@ async def generate_code_and_send(user_id: int, user_text: str, status_message):
     add_to_memory(user_id, "user", user_text)
     add_to_memory(user_id, "assistant", full_response)
 
+
+# ============================================
+# VISION — see images the user sends
+# ============================================
+async def vision_generate(user_id: int, caption: str, data_url: str) -> str:
+    """Generate an answer for an image + caption using VISION_MODEL, with
+    auto-continuation for long answers."""
+    messages = build_messages(user_id, caption)
+    # Turn the final user turn into a multimodal (text + image) message.
+    messages[-1] = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": caption},
+            {"type": "image_url", "image_url": {"url": data_url}},
+        ],
+    }
+    full = ""
+    for attempt in range(MAX_CONTINUATIONS + 1):
+        content, finish = await _call_once(messages, model=VISION_MODEL)
+        full += content
+        if finish == "length" and attempt < MAX_CONTINUATIONS:
+            messages.append({"role": "assistant", "content": content})
+            messages.append({"role": "user", "content": CONTINUE_NUDGE})
+            continue
+        break
+    return full
+
+
+async def run_vision_job(user_id: int, caption: str, image_bytes: bytes, mime: str, status_message):
+    """Queue-aware image analysis: waits for a worker, sees the image, then
+    delivers the answer (code in the reply still becomes a file)."""
+    data_url = f"data:{mime};base64," + base64.b64encode(image_bytes).decode()
+    try:
+        await _maybe_queue_notice(status_message)
+        async with generation_pool:
+            await safe_edit(status_message, "🖼️ Looking at your image…")
+            full = await vision_generate(user_id, caption, data_url)
+    except asyncio.TimeoutError:
+        await safe_edit(status_message, "Request timed out.")
+        return
+    except Exception as e:
+        logger.exception("Vision generation failed")
+        await safe_edit(status_message, f"Error: {str(e)}")
+        return
+
+    await deliver_response(status_message, full, "")
+    add_to_memory(user_id, "user", f"[sent an image] {caption}")
+    add_to_memory(user_id, "assistant", full)
+
 # ============================================
 # TELEGRAM BOT HANDLERS
 # ============================================
@@ -669,7 +730,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/clear — Forget conversation history\n"
         "/whoami — Show your ID and access status\n\n"
         "Just type anything. No filters, no limits.\n"
-        "You can also upload files (.py, .txt, .json, .md, .csv, etc.) for analysis.\n\n"
+        "You can also upload files (.py, .txt, .json, .md, .csv, etc.) for analysis.\n"
+        "🖼️ Send a photo (with an optional caption) and I'll look at it.\n\n"
         f"⚠️ Rate limit: {RATE_LIMIT_MAX} messages every {RATE_LIMIT_WINDOW} seconds."
     )
     if await ac.is_admin(update.effective_user.id):
@@ -725,6 +787,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async with generation_pool:
             await stream_openrouter(user_id, user_text, status_msg)
 
+DEFAULT_IMAGE_PROMPT = "Look at this image and describe everything you see in detail."
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """A compressed photo sent in the chat → send it to the vision model."""
+    if not await ensure_access(update, context):
+        return
+    user_id = update.effective_user.id
+    if is_rate_limited(user_id):
+        await update.message.reply_text(
+            f"🚫 Slow down! You're sending messages too fast. Please wait {RATE_LIMIT_WINDOW} seconds and try again."
+        )
+        return
+    if not await check_rpd(update, context, user_id):
+        return
+
+    photo = update.message.photo[-1]  # highest-resolution size
+    caption = update.message.caption or DEFAULT_IMAGE_PROMPT
+    status_msg = await update.message.reply_text("🖼️ DarkGPT is looking at your image...", do_quote=True)
+    try:
+        tg_file = await context.bot.get_file(photo.file_id)
+        buf = BytesIO()
+        await tg_file.download_to_memory(buf)
+        image_bytes = buf.getvalue()
+    except Exception as e:
+        logger.exception("Photo download failed")
+        await safe_edit(status_msg, f"❌ Could not download the image: {e}")
+        return
+    await run_vision_job(user_id, caption, image_bytes, "image/jpeg", status_msg)
+
+
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_access(update, context):
         return
@@ -745,6 +838,23 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     file_name = file.file_name or "unknown_file"
     ext = Path(file_name).suffix.lower()
+
+    # Image sent as an (uncompressed) document → vision path.
+    if ext in IMAGE_EXTENSIONS:
+        caption = update.message.caption or DEFAULT_IMAGE_PROMPT
+        status_msg = await update.message.reply_text("🖼️ DarkGPT is looking at your image...", do_quote=True)
+        try:
+            tg_file = await context.bot.get_file(file.file_id)
+            buf = BytesIO()
+            await tg_file.download_to_memory(buf)
+            image_bytes = buf.getvalue()
+        except Exception as e:
+            logger.exception("Image document download failed")
+            await safe_edit(status_msg, f"❌ Could not download the image: {e}")
+            return
+        await run_vision_job(user_id, caption, image_bytes, IMAGE_MIME.get(ext, "image/jpeg"), status_msg)
+        return
+
     if ext not in SUPPORTED_TEXT_EXTENSIONS:
         await update.message.reply_text(
             f"❌ Unsupported file type: {ext}\nSupported: {', '.join(sorted(SUPPORTED_TEXT_EXTENSIONS))}"
@@ -1187,6 +1297,7 @@ async def main():
     app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^(approve|deny):"))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_error_handler(error_handler)
 
