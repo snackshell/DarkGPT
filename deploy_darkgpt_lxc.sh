@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # DarkGPT — deploy inside an LXD container on your VPS
-# Allocates: 2 GB RAM, 2 vCPU, 8 GB disk (inside a 10 GB btrfs pool)
+# Allocates: 4 GB RAM, 2 vCPU, 20 GB disk (inside a 25 GB btrfs pool)
 #
 # HOW TO USE (secrets never go in this file):
 #   1) Put this script on the VPS
@@ -20,10 +20,10 @@ fi
 # --- Fixed settings (safe to keep in the repo) -------------------------------
 CONTAINER="darkgpt"
 IMAGE="ubuntu:22.04"
-MEM_LIMIT="2GB"
+MEM_LIMIT="4GB"
 CPU_LIMIT="2"
-DISK_SIZE="8GB"
-POOL_SIZE="10"
+DISK_SIZE="20GB"
+POOL_SIZE="25"
 GIT_BRANCH="${GIT_BRANCH:-claude/chatgpt-access-control-supabase-j6duxk}"
 SUPABASE_URL="${SUPABASE_URL:-https://fxfquwoshovdnqgjejtz.supabase.co}"
 
