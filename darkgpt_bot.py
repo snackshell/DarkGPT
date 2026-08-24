@@ -8,6 +8,7 @@ import json
 import html
 import base64
 import tempfile
+import zipfile
 from io import BytesIO
 from pathlib import Path
 from typing import List, Dict, Tuple
@@ -120,6 +121,14 @@ SUPPORTED_TEXT_EXTENSIONS = {
     ".sh", ".bash", ".c", ".cpp", ".h", ".java", ".rb", ".go",
     ".rs", ".php", ".sql", ".r", ".swift", ".kt", ".ini", ".cfg",
     ".conf", ".toml", ".env", ".dockerfile", ".makefile", ".cmake"
+}
+
+# Extensions that are genuinely source code. Uploading one of these routes to
+# the "edit and return the whole file" agent path instead of a plain analysis.
+CODE_FILE_EXTENSIONS = {
+    ".py", ".js", ".ts", ".html", ".css", ".scss", ".php", ".c", ".h", ".cpp",
+    ".java", ".rb", ".go", ".rs", ".sql", ".sh", ".bash", ".kt", ".swift",
+    ".cs", ".dart", ".r", ".pl", ".lua",
 }
 
 # ============================================
@@ -371,6 +380,28 @@ async def send_code_file(message, filename: str, code: str):
             await asyncio.sleep(CHUNK_SEND_DELAY)
 
 
+async def send_project_zip(message, files: List[Tuple[str, str]], zip_name: str = "project.zip"):
+    """Bundle multiple generated files into a single .zip and send that,
+    instead of sending each file separately. Falls back to individual files
+    if zipping fails for any reason."""
+    try:
+        bio = BytesIO()
+        with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as zf:
+            for fname, code in files:
+                zf.writestr(fname, code)
+        bio.seek(0)
+        bio.name = zip_name
+        await message.reply_document(
+            document=InputFile(bio, filename=zip_name),
+            caption=f"📦 {zip_name} — {len(files)} files",
+        )
+    except Exception:
+        logger.exception("Failed to zip project; sending files individually instead")
+        for fname, code in files:
+            await send_code_file(message, fname, code)
+            await asyncio.sleep(CHUNK_SEND_DELAY)
+
+
 async def _send_text_only(status_message, text: str, last_text: str = ""):
     html_reply = markdown_to_telegram_html(text)
     if len(html_reply) > MAX_MESSAGE_LENGTH:
@@ -422,13 +453,19 @@ async def deliver_response(status_message, full_response: str, last_text: str):
         return
 
     text_part = re.sub(r"\n{3,}", "\n\n", "".join(out_parts)).strip()
-    header = "✅ **Your file is ready!**"
+    is_project = len(files_to_send) >= 2
+    header = "✅ **Your project is ready!**" if is_project else "✅ **Your file is ready!**"
     text_part = f"{header}\n\n{text_part}" if text_part else header
     await _send_text_only(status_message, text_part)
 
-    for fname, code in files_to_send:
-        await send_code_file(status_message, fname, code)
-        await asyncio.sleep(CHUNK_SEND_DELAY)
+    # Multiple files (a real "project") ship as one zip; a single file ships
+    # as itself — no need to zip one script.
+    if is_project:
+        await send_project_zip(status_message, files_to_send)
+    else:
+        for fname, code in files_to_send:
+            await send_code_file(status_message, fname, code)
+            await asyncio.sleep(CHUNK_SEND_DELAY)
 
 
 # ============================================
@@ -511,6 +548,8 @@ CODE_REQUEST_HINTS = (
     "python", " php", " java", "golang", " rust", "react", "node", "sql query",
     "send me the file", "give me the file", "as a file", "write me", "create me",
     "build me", "make me a", "full code", "complete code", "boilerplate",
+    "project", "app", "application", "zip", "fix this", "fix the", "add a feature",
+    "refactor", "rewrite", "modify", "update the code", "debug this",
     ".py", ".html", ".js", ".css", ".php", ".cpp", ".java",
 )
 
@@ -730,8 +769,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/clear — Forget conversation history\n"
         "/whoami — Show your ID and access status\n\n"
         "Just type anything. No filters, no limits.\n"
-        "You can also upload files (.py, .txt, .json, .md, .csv, etc.) for analysis.\n"
-        "🖼️ Send a photo (with an optional caption) and I'll look at it.\n\n"
+        "You can also upload files (.py, .txt, .json, .md, .csv, etc.) — code files get "
+        "edited/fixed and sent back as a full file; other files get analyzed.\n"
+        "🖼️ Send a photo (with an optional caption) and I'll look at it.\n"
+        "📦 Ask for a multi-file project and I'll zip it into one download.\n\n"
         f"⚠️ Rate limit: {RATE_LIMIT_MAX} messages every {RATE_LIMIT_WINDOW} seconds."
     )
     if await ac.is_admin(update.effective_user.id):
@@ -877,16 +918,34 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         caption = update.message.caption or "Analyze this file"
-        prompt = (
-            f"The user uploaded a file named '{file_name}' and said: \"{caption}\"\n\n"
-            f"Here is the file content:\n\n"
-            f"```{ext.lstrip('.')}\n{content}\n```\n\n"
-            f"Analyze this file and respond to the user's request."
-        )
-        await safe_edit(status_msg, "⏳ DarkGPT is analyzing the file...")
-        await _maybe_queue_notice(status_msg)
-        async with generation_pool:
-            await stream_openrouter(user_id, prompt, status_msg)
+        wants_edit = ext in CODE_FILE_EXTENSIONS or looks_like_code_request(caption)
+
+        if wants_edit:
+            # Agent-style edit: return the whole modified file, no streaming,
+            # delivered as a file (same pipeline as fresh code generation) —
+            # a follow-up message can't interrupt it either.
+            edit_prompt = (
+                f"The user uploaded a file named '{file_name}' and said: \"{caption}\"\n\n"
+                f"Here is the CURRENT file content:\n\n"
+                f"```{ext.lstrip('.')}\n{content}\n```\n\n"
+                f"Make the requested changes (or if no specific change was requested, improve/fix "
+                f"the file sensibly) and return the COMPLETE updated file in a single code block "
+                f"of the same language — the whole file, not a diff or partial snippet. You may add "
+                f"a short note above the code block about what changed."
+            )
+            await safe_edit(status_msg, "🛠️ Editing your file in the background — you can keep chatting.")
+            spawn_background(generate_code_and_send(user_id, edit_prompt, status_msg))
+        else:
+            prompt = (
+                f"The user uploaded a file named '{file_name}' and said: \"{caption}\"\n\n"
+                f"Here is the file content:\n\n"
+                f"```{ext.lstrip('.')}\n{content}\n```\n\n"
+                f"Analyze this file and respond to the user's request."
+            )
+            await safe_edit(status_msg, "⏳ DarkGPT is analyzing the file...")
+            await _maybe_queue_notice(status_msg)
+            async with generation_pool:
+                await stream_openrouter(user_id, prompt, status_msg)
 
     except Exception as e:
         logger.exception("File handling error")
